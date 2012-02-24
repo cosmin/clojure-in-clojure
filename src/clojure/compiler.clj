@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [*source-path* *compile-path* *compile-files*])
   (:use [clojure.utilities :only (third fourth)])
   (:use [clojure.runtime :only (namespace-for)])
+  (:use [clojure.compiler.helpers :only (lookup-var-in-current-ns)])
   (:import [clojure.lang IFn AFunction IPersistentMap IObj])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector])
@@ -12,26 +13,6 @@
 
 (declare analyze)
 
-
-(defn- lookup-var* [sym intern-new?]
-  (cond (not (nil? (namespace sym)))
-        (let [ns (namespace-for sym)]
-          (if (nil? ns)
-            nil
-            (let [name (symbol (name nil sym))]
-              (if (and intern-new? (= ns *ns*))
-                (.intern *ns* name)
-                (.findInternedVar ns name)))))
-        
-        
-        )
-  )
-
-(defn lookup-var
-  ([sym intern-new?] (lookup-var sym intern-new? true))
-  ([sym intern-new? register-macro?]
-     (let [lookup-var* (fn [])])
-     ))
 
 
 (declare def-expr-parser)
@@ -150,6 +131,15 @@
 (def ^:dynamic *clear-root* nil)
 (def ^:dynamic *clear-sites* nil)
 
+(defn meta-add-source-line-doc [mm docstring]
+  (let [source-path (if (nil? *source-path*) "NO_SOURCE_FILE" *source-path*)
+        mm (assoc mm :line *line* :file source-path)]
+    (if (not (nil? docstring))
+      (assoc mm :doc docstring)
+      mm)))
+
+
+
 (defprotocol Expr
   (evaluate [this])
   (emit [this context objx ^GeneratorAdapter gen])
@@ -196,22 +186,6 @@
         (.pop gen))))
   (has-java-class? [init] true)
   (get-java-class [init] Var))
-
-(defn- lookup-var-in-current-ns [sym]
-  (let [v (lookup-var sym true)]
-    (if (nil? v)
-      (throw (RuntimeException. "Can't refer to qualified var that doesn't exist"))
-      (if (not (= (namespace v) *ns*))
-        (if (nil? (namespace sym))
-          (.intern *ns* sym)
-          (throw (RuntimeException. "Can't create defs outside of current ns")))))))
-
-(defn- meta-add-source-line-doc [mm docstring]
-  (let [source-path (if (nil? *source-path*) "NO_SOURCE_FILE" *source-path*)
-        mm (assoc mm :line *line* :file source-path)]
-    (if (not (nil? docstring))
-      (assoc mm :doc docstring)
-      mm)))
 
 (defn def-expr-parser
   ([context form]
