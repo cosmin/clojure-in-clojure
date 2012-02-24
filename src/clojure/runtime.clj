@@ -1,5 +1,7 @@
 (ns clojure.runtime
-  (:import [clojure.lang Symbol Namespace]))
+  (:import [clojure.lang Symbol Namespace])
+  (:import [java.io PrintWriter])
+  )
 
 (defn namespace-for
   ([^Symbol sym] (namespace-for *ns* sym))
@@ -29,3 +31,10 @@
   ([sym intern-new? register-macro?]
      (let [lookup-var* (fn [])])
      ))
+
+(defn print-to-error-writer [message & args]
+  (let [err clojure.core/*err*
+        err-writer (if (instance? PrintWriter err)
+                     err
+                     (PrintWriter. err))]
+    (.format err-writer (into-array args))))

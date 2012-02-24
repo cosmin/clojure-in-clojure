@@ -37,3 +37,8 @@
 
 (defn fourth [coll]
   (first (next (next (next coll)))))
+
+(defn primitive? [klass]
+  (and (not-nil? klass)
+       (.isPrimitive klass)
+       (not (= Void/TYPE klass))))
