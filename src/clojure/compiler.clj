@@ -1,7 +1,7 @@
 (ns clojure.compiler
   (:refer-clojure :exclude [*source-path* *compile-path* *compile-files*])
   (:use [clojure.utilities :only (third fourth)])
-  (:use [clojure.runtime :only (namespace-for)])
+  (:use [clojure.runtime :only (namespace-for lookup-var)])
   (:use [clojure.compiler.helpers :only (lookup-var-in-current-ns)])
   (:import [clojure.lang IFn AFunction IPersistentMap IObj])
   (:import [clojure.lang Keyword Var Symbol Namespace])
@@ -12,7 +12,9 @@
   (:import [java.util.regex Pattern]))
 
 (declare analyze)
-
+(declare emit-var)
+(declare emit-var-value)
+(declare host-expr-tag->class)
 
 
 (declare def-expr-parser)
@@ -148,7 +150,7 @@
 
 (defprotocol AssignableExpr
   (eval-assign [this val])
-  (emit-assign [context, objx, gen, val]))
+  (emit-assign [this context objx gen val]))
 
 (declare FnExpr)
 
@@ -246,7 +248,7 @@
 
   Expr
   (evaluate [this] (eval-assign target val))
-  (emit [this context objx gen] (emit-assign context objx gen val))
+  (emit [this context objx gen] (emit-assign target context objx gen val))
   (has-java-class? [this] (has-java-class? val))
   (get-java-class [this] (get-java-class val)))
 
@@ -259,3 +261,43 @@
         (map->AssignExpr {:target target
                           :val (analyze ::expression (third form))})))))
 
+
+(defrecord VarExpr [^Var var, tag]
+  Expr
+  (evaluate [this] (.deref var))
+  (emit [this context objx gen]
+    (emit-var-value objx gen var)
+    (if (== ::statement context)
+      (.pop gen)))
+  (has-java-class? [this] (not (nil? tag)))
+  (get-java-class [this] (host-expr-tag->class tag))
+
+  AssignableExpr
+  (eval-assign [this val] (var-set var (evaluate val)))
+  (emit-assign [this context objx gen val]
+    (let [set-method (Method/getMethod "Object set(Object)")]
+      (emit-var objx var)
+      (emit val ::expression objx gen)
+      (.invokeVirtual gen var-type set-method)
+      (if (= ::statement context)
+        (.pop gen)))))
+
+(defrecord TheVarExpr [^Var var]
+  Expr
+  (evaluate [this] var)
+  (emit [this context objx gen]
+    (emit-var objx gen var)
+    (if (= ::statement context)
+      (.pop gen)))
+  (has-java-class? [this] true)
+  (get-java-class [this] Var))
+
+
+(defn the-var-expr-parser [context form]
+  (let [sym (second form)
+        v (lookup-var sym false)]
+    (if (not (nil? v))
+      (->TheVarExpr v)
+      (throw (RuntimeException. (str "Unable to resolve var: "
+                                     sym
+                                     " in this context"))))))
