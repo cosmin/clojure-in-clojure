@@ -1,6 +1,6 @@
 (ns clojure.compiler
   (:refer-clojure :exclude [*source-path* *compile-path* *compile-files*])
-  (:use [clojure.utilities :only (third fourth)])
+  (:use [clojure.utilities :only (third fourth not-nil?)])
   (:use [clojure.runtime :only (namespace-for lookup-var)])
   (:use [clojure.compiler.helpers :only (lookup-var-in-current-ns)])
   (:use [clojure.compiler.primitives])
@@ -410,3 +410,66 @@
         (let [m (get-primitive-cast-method param-type)]
           (.invokeStatic gen rt-type m))))
     (.checkCast gen (Type/getType param-type))))
+
+(defn maybe-class [form, string-ok?]
+  (cond
+   (instance? Class form)
+   form
+
+   (instance? Symbol form)
+   (let [sym form]
+     (if (nil? (namespace sym)) ; if ns-qualified can't be classname
+       (cond
+        (= sym *compile-stub-sym*)
+        *compile-stub-class*
+
+        (or (> (.indexOf (name sym) ".") 0)
+            (= \[ (.charAt (name sym) 0)))
+        (RT/classForName (name sym))
+
+        :else
+        (let [o (.getMapping *ns* sym)]
+          (if (instance? Class o)
+            o
+            (try
+              (RT/classForName (name sym))
+              (catch Exception e
+                nil)))))))
+
+   (and string-ok? (instance? String form))
+   (RT/classForName form)
+
+   :else
+   nil))
+
+(defn tag-to-class [tag]
+  (let [c (maybe-class tag true)
+        array-class (if (instance? Symbol tag)
+                      (let [sym tag]
+                        ; if ns-qualified can't be classname
+                        (if (nil? (namespace sym))
+                          (condp = (name sym)
+                            "objects" object-array-class
+                            "ints" int-array-class
+                            "longs" long-array-class
+                            "floats" float-array-class
+                            "doubles" double-array-class
+                            "chars" char-array-class
+                            "shorts" short-array-class
+                            "bytes" byte-array-class
+                            "booleans" boolean-array-class))))]
+    (if (not-nil? array-class)
+      array-class
+      (if (not-nil? c)
+        c
+        (throw (IllegalArgumentException.
+                (str "Unable to resolve classname: " tag)))))))
+
+(defn host-expr-parser [context form]
+  (if (< (count form) 3)
+    (throw (IllegalArgumentException. "Malformed member expression, expecting (. target member ...)")))
+
+  (let [c (maybe-class (second form false))]
+
+    )
+  )

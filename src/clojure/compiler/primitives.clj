@@ -32,3 +32,14 @@
 (def from-int-method (Method/getMethod "clojure.lang.Num from(int)"))
 (def from-long-method (Method/getMethod "clojure.lang.Num from(long)"))
 (def from-double-method (Method/getMethod "clojure.lang.Num from(double)"))
+
+(def int-array-class (class (int-array 0)))
+(def long-array-class (class (long-array 0)))
+(def float-array-class (class (float-array 0)))
+(def double-array-class (class (double-array 0)))
+(def char-array-class (class (char-array 0)))
+(def short-array-class (class (short-array 0)))
+(def byte-array-class (class (byte-array 0)))
+(def boolean-array-class (class (boolean-array 0)))
+
+(def object-array-class (class (make-array Object 0)))
