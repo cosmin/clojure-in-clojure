@@ -216,10 +216,10 @@
      (cond
       (> (count form) 3)
       (throw (RuntimeException. "Too many arguments to def"))
-      
+
       (< (count form) 2)
       (throw (RuntimeException. "Too few arguments to def"))
-      
+
       (not (instance? Symbol (second form)))
       (throw (RuntimeException. "First argument to def must be a Symbol")))
      (let [sym (second form)
@@ -367,12 +367,46 @@
             (.mark false-label)
             (.getStatic boolean-object-type, "FALSE", boolean-object-type)
             (.mark end-label))))
-      
+
       Void/TYPE (emit-nil-expr ::expression objx gen)
       Character/TYPE (.invokeStatic gen char-type char-value-of-method)
       Integer/TYPE (.invokeStatic gen integer-type int-value-of-method)
       Float/TYPE (.invokeStatic gen float-type float-value-of-method)
       Double/TYPE (.invokeStatic gen double-type double-value-method)
-      Long/TYPE (.invokeStatic gen numbers-type (Method/getMethod "Number num(long)"))
+      Long/TYPE (.invokeStatic gen number-type (Method/getMethod "Number num(long)"))
       Byte/TYPE (.invokeStatic gen byte-type byte-value-of-method)
       Short/TYPE (.invokeStatic gen short-type short-value-of-method))))
+
+
+(defn- get-primitive-cast-method [param-type]
+  (if clojure.core/*unchecked-math*
+    (condp = param-type
+      Integer/TYPE (Method/getMethod "int uncheckedIntCast(Object)")
+      Float/TYPE (Method/getMethod "float uncheckedFloatCast(Object)")
+      Double/TYPE (Method/getMethod "double uncheckedDoubleCast(Object)")
+      Long/TYPE (Method/getMethod "long uncheckedLongCast(Object)")
+      Byte/TYPE (Method/getMethod "byte uncheckedByteCast(Object)")
+      Short/TYPE (Method/getMethod "short uncheckedShortCast(Object)"))
+    (condp = param-type
+      Integer/TYPE (Method/getMethod "int intCast(Object)")
+      Float/TYPE (Method/getMethod "float floatCast(Object)")
+      Double/TYPE (Method/getMethod "double doubleCast(Object)")
+      Long/TYPE (Method/getMethod "long longCast(Object)")
+      Byte/TYPE (Method/getMethod "byte byteCast(Object)")
+      Short/TYPE (Method/getMethod "short shortCast(Object)"))))
+
+(defn emit-unbox-arg [objx, ^GeneratorAdapter gen, ^Class param-type]
+  (if (.isPrimitive param-type)
+    (condp = param-type
+      Boolean/TYPE (doto gen
+                     (.checkCast boolean-type)
+                     (.invokeVirtual gen boolean-type boolean-value-method))
+
+      Character/TYPE (doto gen
+                       (.checkCast char-type)
+                       (.invokeVirtual char-type char-value-method))
+      (do
+        (.checkCast number-type)
+        (let [m (get-primitive-cast-method param-type)]
+          (.invokeStatic gen rt-type m))))
+    (.checkCast gen (Type/getType param-type))))
