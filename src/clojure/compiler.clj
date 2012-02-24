@@ -1,4 +1,4 @@
-(ns clojure-compiler.core
+(ns clojure.compiler
   (:refer-clojure :exclude [*source-path* *compile-path* *compile-files*])
   (:import [clojure.lang IFn AFunction IPersistentMap IObj])
   (:import [clojure.lang Keyword Var Symbol Namespace])
