@@ -32,9 +32,11 @@
      (let [lookup-var* (fn [])])
      ))
 
+(defn err-print-writer []
+  (let [err clojure.core/*err*]
+    (if (instance? PrintWriter err)
+      err
+      (PrintWriter. err))))
+
 (defn print-to-error-writer [message & args]
-  (let [err clojure.core/*err*
-        err-writer (if (instance? PrintWriter err)
-                     err
-                     (PrintWriter. err))]
-    (.format err-writer (into-array args))))
+  (.format (err-print-writer) message (into-array args)))

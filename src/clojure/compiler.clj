@@ -1,24 +1,24 @@
 (ns clojure.compiler
   (:refer-clojure :exclude [*source-path* *compile-path* *compile-files* munge])
-  (:use clojure.utilities)
-  (:use [clojure.runtime :only (namespace-for lookup-var print-to-error-writer)])
+  (:use [clojure utilities runtime])
   (:use [clojure.compiler.helpers :only (lookup-var-in-current-ns)])
-  (:use [clojure.compiler.primitives])
+  (:use [clojure.compiler primitives])
+  (:use [clojure.lang reflection])
   (:import [clojure.lang IFn AFunction IPersistentMap IObj])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector])
-  (:import [clojure.asm Type])
+  (:import [clojure.asm Type Opcodes])
   (:import [clojure.asm.commons GeneratorAdapter Method])
   (:import [java.lang.reflect Constructor Modifier])
+  (:import [java.util ArrayList LinkedList])
   (:import [java.util.regex Pattern]))
-
-(def TODO nil)
 
 (declare analyze)
 (declare emit-var)
 (declare emit-var-value)
 (declare emit-keyword)
 (declare emit-nil-expr)
+(declare emit-clear-locals)
 (declare host-expr-tag->class)
 
 (declare def-expr-parser)
@@ -179,7 +179,7 @@
 (defprotocol Expr
   (evaluate [this])
   (emit [this context objx ^GeneratorAdapter gen])
-  (^boolean has-java-class? [this])
+  (has-java-class? [this])
   (^Class get-java-class [this]))
 
 (defprotocol AssignableExpr
@@ -190,16 +190,18 @@
   (value [this]))
 
 (defprotocol MaybePrimitiveExpr
-  (^boolean can-emit-primitive [this])
+  (can-emit-primitive [this])
   (emit-unboxed [this context, ^clojure.compiler.ObjExpr objx,^GeneratorAdapter gen]))
 
 (defn eval-or-expression [context]
   (if (= ::eval context) context ::expression))
 
+
 (declare FnExpr)
+(declare ThrowExpr)
 
 (defrecord DefExpr [^Var var, init, meta,
-                    ^boolean init-provided?, ^boolean dynamic?,
+                    init-provided?, dynamic?,
                     ^String source, ^long line]
   Expr
   (evaluate [this]
@@ -298,7 +300,7 @@
   (if  (not= 3 (count form))
     (throw (IllegalArgumentException. "Malformed assignment, expecting (set! target val)"))
     (let [target (analyze ::expression (second form))]
-      (if (not (instance? AssignableExpr target))
+      (if (not (satisfies? AssignableExpr target))
         (throw (IllegalArgumentException. "Invalid assignment target"))
         (map->AssignExpr {:target target
                           :val (analyze ::expression (third form))})))))
@@ -442,6 +444,57 @@
           (.invokeStatic gen rt-type m))))
     (.checkCast gen (Type/getType param-type))))
 
+(defn emit-args-as-array [args objx ^GeneratorAdapter gen]
+  (.push gen (count args))
+  (.newArray gen object-type)
+  (doseq [i (range count)]
+    (.dup gen)
+    (.push gen i)
+    (emit (nth args i) ::expression objx gen)
+    (.arrayStore gen object-type)))
+
+(defn emit-typed-args [objx, ^GeneratorAdapter gen, parameter-types, args]
+  (doseq [i (range (alength parameter-types))]
+    (let [e (nth args i)]
+      (try
+        (let [primc (maybe-primitive-type e)]
+          (cond
+           (= primc (aget parameter-types i))
+           (emit-unboxed e ::expression objx gen)
+
+           (and (= primc Integer/TYPE) (= Long/TYPE (aget parameter-types i)))
+           (do
+             (emit-unboxed e ::expression objx gen)
+             (.visitInsn gen Opcodes/I2L))
+
+           (and (= Long/TYPE primc) (= Integer/TYPE (aget parameter-types i)))
+           (do
+             (emit-unboxed e ::expression objx gen)
+             (if clojure.core/*unchecked-math*
+               (.invokeStatic gen
+                              rt-type
+                              (Method/getMethod "int uncheckedIntCast(long)"))
+               (.invokeStatic gen
+                              rt-type
+                              (Method/getMethod "int intCast(long)"))))
+
+           (and (= Float/TYPE primc) (= Double/TYPE (aget parameter-types i)))
+           (do
+             (emit-unboxed e ::expression objx gen)
+             (.visitInsn gen Opcodes/F2D))
+
+           (and (= Double/TYPE primc) (= Float/TYPE (aget parameter-types i)))
+           (do
+             (emit-unboxed e ::expression objx gen)
+             (.visitInsn gen Opcodes/D2F))
+
+           :else
+           (do
+             (emit e ::expression objx gen)
+             (emit-unbox-arg objx gen (aget parameter-types i)))))
+        (catch Exception e1
+          (.printStackTrace e1 (err-print-writer)))))))
+
 (defn maybe-class [form, string-ok?]
   (cond
    (class? form)
@@ -516,13 +569,77 @@
      (string? tag) (symbol nil tag)
      :else nil)))
 
+(defn- maybe-primitive-type [e]
+  (try
+    (if (and (satisfies? MaybePrimitiveExpr e)
+             (has-java-class? e)
+             (can-emit-primitive e))
+      (do
+        (let [c (get-java-class e)]
+          (if (primitive? c)
+            c))))
+    (catch Exception ex
+      (throw-runtime ex))))
+
+(defn- maybe-java-class [exprs]
+  (let [without-throw (filter #(not (instance? ThrowExpr %)) exprs)
+        with-java-class (filter #(has-java-class? %1) without-throw)
+        first-match (first with-java-class)
+        second-match (second with-java-class)]
+    (if (not-nil? first-match)
+      (if (not-nil? second-match)
+        nil
+        first-match
+        ))))
+
+(defrecord StaticFieldExpr [field-name c field tag line]
+  Expr
+  (evaluate [this] (Reflector/getStaticField c field-name))
+  (emit [this context objx gen]
+    (.visitLineNumber gen line (.mark gen))
+    (.getStatic gen (Type/getType c) field-name (Type/getType (.getType field)))
+    (emit-box-return objx gen (.getType field))
+    (if (= ::statement context)
+      (.pop gen)))
+  (has-java-class? [this] true)
+  (get-java-class [this] (if (not-nil? tag) (tag-to-class tag) (.getType field)))
+
+  MaybePrimitiveExpr
+  (can-emit-primitive [this] (primitive? (.getType field)))
+  (emit-unboxed [this context objx gen]
+    (.visitLineNumber gen line (.mark gen))
+    (.getStatic gen (Type/getType c) field-name (Type/getType (.getType field))))
+
+
+  AssignableExpr
+  (eval-assign [this val] (Reflector/setStaticField c field-name (evaluate val)))
+  (emit-assign [this context objx gen val]
+    (.visitLineNumber gen line (.mark gen))
+    (emit val ::expression objx gen)
+    (.dup gen)
+    (emit-unbox-arg objx gen (.getType field))
+    (.putStatic gen (Type/getType c) field-name (Type/getType (.getType field)))
+    (if (= ::statement context)
+      (.pop gen))))
+
 (defn new-static-field-expr [line c field-name tag]
-  TODO)
+  (try
+    (let [field (.getField c field-name)]
+      (map->StaticFieldExpr {:field-name field-name
+                             :line line
+                             :c c
+                             :field field
+                             :tag tag}))
+    (catch NoSuchFieldException e
+      (throw-runtime e))))
 
 (def invoke-no-arg-instance-member
   (Method/getMethod "Object invokeNoArgInstanceMember(Object,String)"))
 (def set-instance-field-method
   (Method/getMethod "Object setInstanceField(Object,String,Object)"))
+
+(def invoke-instance-method-method
+  (Method/getMethod "Object invokeInstanceMethod(Object,String,Object[])"))
 
 (defrecord InstanceFieldExpr [target target-class field field-name line tag]
   Expr
@@ -551,7 +668,7 @@
     (if (not-nil? tag)
       (tag-to-class tag)
       (.getType field)))
-    
+
   MaybePrimitiveExpr
   (can-emit-primitive [this]
     (and (not-nil? target-class)
@@ -567,7 +684,7 @@
                        field-name
                        (Type/getType (.getType field)))))
       (throw (UnsupportedOperationException. "Unboxed emit of unknown member"))))
-  
+
   AssignableExpr
   (eval-assign [this val]
     (Reflector/setInstanceField (evaluate target) field-name (evaluate val)))
@@ -590,7 +707,7 @@
           )
       )
     )
-  
+
   )
 
 (defn new-instance-field-expr [line target field-name tag]
@@ -608,8 +725,78 @@
 (defn new-static-method-expr [source line tag c method-name tag]
   TODO)
 
+
+(defrecord InstanceMethodExpr [target method-name args source line tag method]
+  Expr
+  (evaluate [this]
+    (try
+      (let [targetval (evaluate target)
+            argvals (make-array Object (count args))]
+        (doseq [i (range (count args))]
+          (aset argvals i (evaluate (nth args i))))
+        (if (not-nil? method)
+          (let [ms (LinkedList.)]
+            (.add ms method)
+            (invoke-static-method method-name ms targetval argvals)))
+        (Reflector/invokeInstanceMethod targetval method-name argvals))
+      (catch Throwable e
+        (if (instance? clojure.lang.Compiler$CompilerException e)
+          (throw e)
+          (throw (clojure.lang.Compiler$CompilerException. source line e))))))
+  (emit [this context objx gen]
+    (.visitLineNumber line (.mark gen))
+    (if (not-nil? method)
+      (let [type (Type/getType (.getDeclaringClass method))]
+        (emit target ::expression objx gen)
+        (.checkCast gen type)
+        (emit-typed-args objx gen (.getParameterTypes method) args)
+        (if (= ::return context)
+          (emit-clear-locals *method* gen))
+        (let [m (Method. method-name (Type/getReturnType method) (Type/getArgumentTypes method))]
+          (if (.. method getDeclaringClass isInterface)
+            (.invokeInterface gen type m)
+            (.invokeVirtual gen type m)))
+        (emit-box-return objx gen (.getReturnType method)))))
+  (has-java-class? [this] (not (and (nil? method) (nil? tag))))
+  (get-java-class [this]
+    (if (not-nil? tag)
+      (tag-to-class tag)
+      (.getReturnType method)))
+
+  MaybePrimitiveExpr
+  (can-emit-primitive [this] (and (not-nil? method) (primitive? (.getReturnType method))))
+  (emit-unboxed [this context objx gen]
+    (.visitLineNumber gen line (.mark gen))
+    (if (nil? method)
+      (throw (UnsupportedOperationException. "Unboxed emit of unknown member"))
+      (let [type (Type/getType (.getDeclaringClass method))]
+        (emit target ::expression objx gen)
+        (.checkCast gen type)
+        (emit-typed-args objx gen (.getParameterTypes method) args)
+        (if (= ::return context)
+          (emit-clear-locals *method* gen))
+        (let [m (Method. method-name (Type/getReturnType method) (Type/getArgumentTypes method))]
+          (if (.. method getDeclaringClass isInterface)
+            (.invokeInterface gen type m)
+            (.invokeVirtual gen type m)))))))
+
 (defn new-instance-method-expr [source line tag target method-name args]
-  TODO)
+
+  (let [method (if (and (has-java-class? target) (not-nil? (get-java-class target)))
+                 (let [methods (Reflector/getMethods (get-java-class target)
+                                                     (count args)
+                                                     method-name
+                                                     false)]
+                   (get-method-with-name-and-args methods method-name args)))]
+    (if (and (nil? method) clojure.core/*warn-on-reflection*)
+      (print-to-error-writer "Reflection warning, %s:%d - call to %s can't be resolved.\n" *source-path* line method-name))
+    (map->InstanceMethodExpr {:target target
+                              :method-name method-name
+                              :args args
+                              :source source
+                              :line line
+                              :tag tag
+                              :method method})))
 
 
 
