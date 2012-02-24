@@ -146,6 +146,10 @@
   (^boolean has-java-class? [this])
   (^Class get-java-class [this]))
 
+(defprotocol AssignableExpr
+  (eval-assign [this val])
+  (emit-assign [context, objx, gen, val]))
+
 (declare FnExpr)
 
 (defrecord DefExpr [^Var var, init, meta,
@@ -236,3 +240,22 @@
                         :meta meta
                         :init-provided? (= 3 (count form))
                         :dynamic? dynamic?})))))
+
+(defrecord AssignExpr [^clojure.compiler.AssignableExpr target,
+                       ^clojure.compiler.Expr val]
+
+  Expr
+  (evaluate [this] (eval-assign target val))
+  (emit [this context objx gen] (emit-assign context objx gen val))
+  (has-java-class? [this] (has-java-class? val))
+  (get-java-class [this] (get-java-class val)))
+
+(defn assign-expr-parser [context form]
+  (if (not (= 3 (count form)))
+    (throw (IllegalArgumentException. "Malformed assignment, expecting (set! target val)"))
+    (let [target (analyze ::expression (second form))]
+      (if (not (instance? AssignableExpr target))
+        (throw (IllegalArgumentException. "Invalid assignment target"))
+        (map->AssignExpr {:target target
+                          :val (analyze ::expression (third form))})))))
+
