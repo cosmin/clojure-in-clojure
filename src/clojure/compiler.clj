@@ -1,5 +1,7 @@
 (ns clojure.compiler
   (:refer-clojure :exclude [*source-path* *compile-path* *compile-files*])
+  (:use [clojure.utilities :only (third fourth)])
+  (:use [clojure.runtime :only (namespace-for)])
   (:import [clojure.lang IFn AFunction IPersistentMap IObj])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector])
@@ -8,11 +10,8 @@
   (:import [java.lang.reflect Constructor Modifier])
   (:import [java.util.regex Pattern]))
 
-(defn third [coll]
-  (first (next (next coll))))
+(declare analyze)
 
-(defn fourth [coll]
-  (first (next (next (next coll)))))
 
 (defn- lookup-var* [sym intern-new?]
   (cond (not (nil? (namespace sym)))
@@ -23,7 +22,7 @@
               (if (and intern-new? (= ns *ns*))
                 (.intern *ns* name)
                 (.findInternedVar ns name)))))
-        TODO
+        
         
         )
   )
@@ -237,29 +236,29 @@
            mm (meta sym)
            dynamic? (:dynamic mm)]
        (if (dynamic?)
-         (.setDynamic v)
-         (if (and (.startsWith (name sym) "*")
-                  (.endsWith (name sym) "*")
-                  (> 1 (.length (name sym))))
-           (.. RT
-               errPrintWriter
-               (format
-                (str "Warning: %1$s not declared dynamic "
-                     "and thus is not dynamically rebindable, "
-                     "but its name suggests otherwise. "
-                     "Please either indicate ^:dynamic %1$s "
-                     "or change the name. (%2$s:%3$d)\n")
-                sym *source-path*, *line*)))
-         (if (:arglists mm)
-           (let [vm (meta v)]
-             (.setMeta v (assoc vm :arglists (second (:arglists mm))))))
-         (let [mm (meta-add-source-line-doc mm docstring)
-               mcontext (if (= ::eval context) context ::expression)
-               meta (if (= 0 (count mm)) nil (analyze mcontext mm))]
-           (new DefExpr {:source *source*
-                         :line *line*
-                         :var v
-                         :init (analyze mcontext (third form))
-                         :meta meta
-                         :init-provided? (= 3 (count form))
-                         :dynamic? dynamic?}))))))
+         (.setDynamic v))
+       (if (and (.startsWith (name sym) "*")
+                (.endsWith (name sym) "*")
+                (> 1 (.length (name sym))))
+         (.. RT
+             errPrintWriter
+             (format
+              (str "Warning: %1$s not declared dynamic "
+                   "and thus is not dynamically rebindable, "
+                   "but its name suggests otherwise. "
+                   "Please either indicate ^:dynamic %1$s "
+                   "or change the name. (%2$s:%3$d)\n")
+              sym *source-path*, *line*)))
+       (if (:arglists mm)
+         (let [vm (meta v)]
+           (.setMeta v (assoc vm :arglists (second (:arglists mm))))))
+       (let [mm (meta-add-source-line-doc mm docstring)
+             mcontext (if (= ::eval context) context ::expression)
+             meta (if (= 0 (count mm)) nil (analyze mcontext mm))]
+         (map->DefExpr {:source *source*
+                        :line *line*
+                        :var v
+                        :init (analyze mcontext (third form))
+                        :meta meta
+                        :init-provided? (= 3 (count form))
+                        :dynamic? dynamic?})))))

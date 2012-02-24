@@ -1,16 +1,9 @@
 (ns clojure.reader.symbols
-  (:use clojure.reader.util)
+  (:use clojure.utilities)
+  (:use clojure.runtime)
   (:import [java.util.regex Pattern Matcher]
            [clojure.lang Namespace Compiler Symbol Keyword Var]))
 
-(defn namespace-for
-  ([^Symbol sym] (namespace-for *ns* sym))
-  ([^Namespace inns, ^Symbol sym]
-     (let [ns-sym (symbol (.ns sym))
-           ns (.lookupAlias inns ns-sym )]
-       (if (nil? ns)
-         (Namespace/find ns-sym)
-         ns))))
 
 (def symbol-pattern (Pattern/compile "[:]?([\\D&&[^/]].*/)?([\\D&&[^/]][^/]*)"))
 (defn match-symbol [s]

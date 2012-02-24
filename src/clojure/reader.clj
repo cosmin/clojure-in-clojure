@@ -1,6 +1,6 @@
 (ns clojure.reader
   (:refer-clojure :exclude [read read-string])
-  (:use clojure.reader.util
+  (:use clojure.utilities
         [clojure.reader.numbers :only (match-number)]
         [clojure.reader.symbols :only (interpret-token resolve-symbol is-special)])
   (:import [java.io PushbackReader StringReader]
@@ -31,6 +31,58 @@
                 (= \\ (char ch))
                 ))
        (macro? ch)))
+
+(defn whitespace?
+  "Determine if the character is considered whitespace in Clojure"
+  [ch]
+  (if (= -1 ch)
+    false
+    (or (Character/isWhitespace ch) (= \, (char ch)))))
+
+(defn plus-or-minus? [^Character ch]
+  (let [chr (char ch)]
+    (or (= chr \+) (= chr \-))))
+
+(defn get-line-number [^PushbackReader reader]
+  (if (instance? LineNumberingPushbackReader reader)
+    (.getLineNumber reader)
+    -1))
+
+(defn digit? [chr]
+  (Character/isDigit chr))
+
+(defn char->digit [chr base]
+  (Character/digit chr base))
+
+(defn eof? [ch]
+  (or (= -1 ch) (= 65535 ch)))
+
+(def ^:dynamic *replace-eof-with* nil)
+
+(def ^:dynamic *eof-msg* "EOF while reading")
+
+(defn read-one
+  ([^PushbackReader stream] (read-one stream *eof-msg*))
+  ([^PushbackReader stream, ^String eof-error-message]
+     (let [ch (.read stream)]
+       (if (eof? ch)
+         (if (nil? *replace-eof-with*)
+           (throw (RuntimeException. eof-error-message))
+           *replace-eof-with*)
+         (char ch)))))
+
+(defn unread [^PushbackReader reader, chr]
+  (.unread reader (int chr)))
+
+(def ^:dynamic *hashtable-threshold* 32)
+
+;; re-implementation of RT/map
+(defn make-map [array-contents]
+  (let [size (alength array-contents)]
+    (cond
+     (= 0 size) {}
+     (<= size *hashtable-threshold*) (apply array-map array-contents)
+     :else (apply hash-map array-contents))))
 
 (defn- read-a-token [^PushbackReader stream, ch]
   (let [sb (StringBuilder.)]
