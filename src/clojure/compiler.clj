@@ -3,6 +3,7 @@
   (:use [clojure.utilities :only (third fourth)])
   (:use [clojure.runtime :only (namespace-for lookup-var)])
   (:use [clojure.compiler.helpers :only (lookup-var-in-current-ns)])
+  (:use [clojure.compiler.primitives])
   (:import [clojure.lang IFn AFunction IPersistentMap IObj])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector])
@@ -14,7 +15,10 @@
 (declare analyze)
 (declare emit-var)
 (declare emit-var-value)
+(declare emit-keyword)
+(declare emit-nil-expr)
 (declare host-expr-tag->class)
+
 
 
 (declare def-expr-parser)
@@ -151,6 +155,13 @@
 (defprotocol AssignableExpr
   (eval-assign [this val])
   (emit-assign [this context objx gen val]))
+
+(defprotocol LiteralExpr
+  (value [this]))
+
+(defprotocol MaybePrimitiveExpr
+  (^boolean can-emit-primitive [this])
+  (emit-unboxed [this context, ^clojure.compiler.ObjExpr objx,^GeneratorAdapter gen]))
 
 (declare FnExpr)
 
@@ -298,6 +309,70 @@
         v (lookup-var sym false)]
     (if (not (nil? v))
       (->TheVarExpr v)
-      (throw (RuntimeException. (str "Unable to resolve var: "
-                                     sym
+      (throw (RuntimeException. (str "Unable to resolve var: " sym
                                      " in this context"))))))
+
+
+(defrecord KeywordExpr [^Keyword k]
+  LiteralExpr
+  (value [this] k)
+
+  Expr
+  (evaluate [this] k)
+  (emit [this context objx gen]
+    (emit-keyword objx gen k)
+    (if (= ::statement context)
+      (.pop gen)))
+  (has-java-class? [this] true)
+  (get-java-class [this] Keyword))
+
+(defrecord ImportExpr [^String c]
+  Expr
+  (evaluate [this]
+    (do
+      (.importClass *ns* (RT/classForName c))
+      nil))
+
+  (emit [this context objx gen]
+    (let [for-name-method (Method/getMethod "Class forName(String)")
+          import-class-method (Method/getMethod "Class importClass(Class)")
+          deref-method (Method/getMethod "Object deref()")]
+      (doto gen
+        (.genStatic rt-type "CURRENT_NS" var-type)
+        (.invokeVirtual var-type deref-method)
+        (.checkCast ns-type)
+        (.push c)
+        (.invokeStatic class-type for-name-method)
+        (.invokeVirtual ns-type import-class-method))
+      (if (= ::statement context)
+        (.pop gen))))
+
+  (has-java-class? [this] false)
+  (get-java-class [this] (throw (IllegalArgumentException. "ImportExpr has no Java class"))))
+
+(defn import-expr-parser [context form]
+  (->ImportExpr (second form)))
+
+(defn emit-box-return [objx, ^GeneratorAdapter gen, ^Class return-type]
+  (if (.isPrimitive return-type)
+    (condp = return-type
+      Boolean/TYPE
+      (do
+        (let [false-label (.newLabel gen)
+              end-label (.newLabel gen)]
+          (doto gen
+            (.ifZCmp GeneratorAdapter/EQ false-label)
+            (.getStatic boolean-object-type, "TRUE", boolean-object-type)
+            (.goTo end-label)
+            (.mark false-label)
+            (.getStatic boolean-object-type, "FALSE", boolean-object-type)
+            (.mark end-label))))
+      
+      Void/TYPE (emit-nil-expr ::expression objx gen)
+      Character/TYPE (.invokeStatic gen char-type char-value-of-method)
+      Integer/TYPE (.invokeStatic gen integer-type int-value-of-method)
+      Float/TYPE (.invokeStatic gen float-type float-value-of-method)
+      Double/TYPE (.invokeStatic gen double-type double-value-method)
+      Long/TYPE (.invokeStatic gen numbers-type (Method/getMethod "Number num(long)"))
+      Byte/TYPE (.invokeStatic gen byte-type byte-value-of-method)
+      Short/TYPE (.invokeStatic gen short-type short-value-of-method))))
