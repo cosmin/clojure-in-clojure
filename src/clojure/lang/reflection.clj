@@ -30,5 +30,7 @@
         m))))
 
 (defn invoke-static-method [method-name ms targetval argvals]
-  TODO
   (throw (RuntimeException. "invoke-static-method not implemented")))
+
+(defn invoke-matching-method [method-name methods target args]
+  (throw (RuntimeException. "invoke-matching-metho not implemented")))
