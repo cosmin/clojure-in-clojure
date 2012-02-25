@@ -70,6 +70,7 @@
 (declare monitor-exit-expr-parser)
 (declare new-expr-parser)
 (declare new-constant-expr)
+(declare new-meta-expr)
 
 (def char-map
   {\- "_",
@@ -1099,3 +1100,53 @@
      (string? v) (new-string-expr v)
      (and (coll? v) (= 0 (count v))) (new-empty-expr)
      :else (new-constant-expr v))))
+
+(defrecord ListExpr [args]
+  Expr
+  (evaluate [this]
+    (seq (into [] (map #(evaluate %1) args))))
+  (emit [this context objx gen]
+    (let [array-to-list-method (Method/getMethod
+                                "clojure.lang.ISeq arrayToList(Object[])")]
+      (emit-args-as-array args objx gen)
+      (.invokeStatic gen rt-type array-to-list-method)
+      (pop-if-statement)))
+  (has-java-class? [this] true)
+  (get-java-class [this] IPersistentList))
+
+(defn new-list-expr [args]
+  (->ListExpr args))
+
+(defrecord MapExpr [keyvals]
+  Expr
+  (evaluate [this]
+    (let [ret (make-array Object (count keyvals))]
+      (doseq [i (range (count keyvals))]
+        (aset ret (evaluate (nth keyvals i))))
+      (RT/map ret)))
+  (emit [this context objx gen]
+    (let [map-method (Method/getMethod "clojure.lang.IPersistentMap map(Object[])")]
+      (emit-args-as-array keyvals objx gen)
+      (.invokeStatic gen rt-type map-method)
+      (pop-if-statement)))
+  (has-java-class? [this] true)
+  (get-java-class [this] IPersistentMap))
+
+(defn new-map-expr [keyvals]
+  (->MapExpr keyvals))
+
+(defn parse-map-expr [context form]
+  (let [keyvals (into [] (map #(analyze (eval-or-expression context) %1) (seq form)))
+        constant (every? #(satisfies? LiteralExpr %1) keyvals)
+        ret (new-map-expr keyvals)]
+    (cond
+     (and (instance? IObj form) (not-nil? (meta form)))
+     (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
+
+     constant
+     (new-constant-expr (let [m (transient {})]
+                          (doseq [i (range 0 (count keyvals) 2)]
+                            (assoc! m (nth keyvals i) (nth keyvals (inc i))))
+                          (persistent! m)))
+
+     :else ret)))
