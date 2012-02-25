@@ -4,6 +4,7 @@
   (:use [clojure.compiler primitives helpers])
   (:use [clojure.lang reflection])
   (:require [clojure.lang.intrinsics :as intrinsics])
+  (:import [clojure.lang ILookupSite ILookupThunk KeywordLookupSite])
   (:import [clojure.lang PersistentArrayMap PersistentHashSet PersistentVector PersistentList PersistentList$EmptyList])
   (:import [clojure.lang IPersistentList IPersistentMap IPersistentVector IPersistentSet])
   (:import [clojure.lang IFn AFunction IObj LazySeq ISeq RestFn AFn])
@@ -993,6 +994,44 @@
           (.put *constant-ids* o (count *constants*))
           (count *constants*))))))
 
+(defn- register-keyword-callsite [kw]
+  (if (not (bound? *keyword-callsites*))
+    (throw (IllegalAccessError. "KEYWORD_CALLSITES is not bound"))
+    (do
+      (var-set *keyword-callsites* (conj *keyword-callsites* kw))
+      (dec (count *keyword-callsites*)))))
+
+(defn- site-name [n]
+  (str "__site__" n))
+
+(defn- site-name-static [n]
+  (str (site-name n) "__"))
+
+(defn- thunk-name [n]
+  (str "__thunk__" n))
+
+(defn- cached-class-name [n]
+  (str "__cached_class__" n))
+
+(defn- cached-var-name [n]
+  (str "__cached_var__" n))
+
+(defn- cached-proto-fn-name [n]
+  (str "__cached_proto_fn__" n))
+
+(defn- cached-proto-impl-name [n]
+  (str "__cached_proto_impl__" n))
+
+(defn- var-callsite-name [n]
+  (str "__var__callsite__" n))
+
+(defn- thunk-name-static [n]
+  (str (thunk-name n) "__"))
+
+(def ilookup-site-type (Type/getType ILookupSite))
+(def ilookup-thunk-type (Type/getType ILookupThunk))
+(def keyword-lookupsite-type (Type/getType KeywordLookupSite))
+
 (defn new-number-expr [n]
   (map->NumberExpr {:n n
                     :id (register-constant n)}))
@@ -1211,3 +1250,53 @@
                             (conj! rv (value (nth args i))))
                           (persistent! rv)))
      :else ret)))
+
+(defrecord KeywordInvokeExpr [kw tag target line site-index source]
+  Expr
+  (evaluate [this]
+    (try
+      (.invoke (:k kw) (evaluate target))
+      (catch Throwable e
+        (if (instance? clojure.lang.Compiler$CompilerException e)
+          (throw e)
+          (throw (clojure.lang.Compiler$CompilerException. source line e))))))
+  (emit [this context objx gen]
+    (let [end-label (.newLabel gen)
+          fault-label (.newLabel gen)]
+      (visit-line-number)
+      (doto gen
+        (.getStatic (:objtype objx)
+                    (thunk-name-static objx site-index)
+                    ilookup-thunk-type)
+        (.dup))
+      (emit target :expression objx gen)
+      (doto gen
+        (.invokeInterface ilookup-thunk-type (Method/getMethod "Object get(Object)")) ; target,thunk,result
+        (.dupX2) ; result,target,thunk,result
+        (.visitJumpInsn Opcodes/IF_ACMPEQ fault-label) ; result,target
+        (.pop) ; result
+        (.goTo end-label)
+        (.mark fault-label) ; result,target
+        (.swap) ; target,result
+        (.pop) ; target
+        (.dup) ; target,target
+        (.getStatic (:objtype objx) (site-name-static objx site-index) keyword-lookupsite-type) ; target,target,site
+        (.swap) ; target,site,target
+        (.invokeInterface ilookup-site-type (Method/getMethod "clojure.lang.ILookupThunk fault(Object)")) ; target,new-thunk
+        (.dup) ; target,new-thunk,new-thunk
+        (.putStatic (:objtype objx) (thunk-name-static objx site-index), ilookup-thunk-type) ; target,new-thunk
+        (.swap) ; new-thunk,target
+        (.invokeInterface ilookup-thunk-type, (Method/getMethod "Object get(Object)")) ; result
+        (.mark end-label))
+      (pop-if-statement)))
+  (has-java-class? [this] (not-nil? tag))
+  (get-java-class [this] (tag-to-class tag)))
+
+(defn new-keyword-invoke-expr [source line tag kw target]
+  (let [site-index (register-keyword-callsite (:k kw))]
+    (map->KeywordInvokeExpr {:kw kw
+                             :tag tag
+                             :target target
+                             :line line
+                             :site-index site-index
+                             :source source})))
