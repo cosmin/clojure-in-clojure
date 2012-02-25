@@ -34,3 +34,6 @@
 (defmacro pop-if-statement []
   `(if (= :statement ~'context)
      (.pop ~'gen)))
+
+(defn assignable-from? [from assignable]
+  (. from isAssignableFrom assignable))

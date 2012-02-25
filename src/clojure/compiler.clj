@@ -4,7 +4,7 @@
   (:use [clojure.compiler primitives helpers])
   (:use [clojure.lang reflection])
   (:require [clojure.lang.intrinsics :as intrinsics])
-  (:import [clojure.lang IFn AFunction IPersistentMap IObj])
+  (:import [clojure.lang IFn AFunction IPersistentMap IObj LazySeq ISeq RestFn AFn])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector Intrinsics])
   (:import [clojure.asm Type Opcodes])
@@ -16,7 +16,33 @@
 (declare analyze)
 (declare emit-var)
 (declare emit-var-value)
-(declare emit-keyword)
+
+(def ^:private const-prefix "const__")
+
+(defn- constant-type [objx id]
+  (let [constants (:constants objx)
+        o (nth constants id)
+        c (class o)]
+    (if (and (not-nil? c) (Modifier/isPublic (.getModifiers c)))
+      (cond
+       (assignable-from? LazySeq c) (Type/getType ISeq)
+       (= Keyword c) (Type/getType Keyword)
+       (assignable-from? RestFn c) (Type/getType RestFn)
+       (assignable-from? AFn c) (Type/getType AFn)
+       (= Var c) (Type/getType Var)
+       (= String c) (Type/getType String))
+      object-type)))
+
+(defn- constant-name [id]
+  (str const-prefix id))
+
+(defn- emit-constant [objx gen id]
+  (.getStatic gen (:objtype objx) (constant-name id) (constant-type id)))
+
+(defn- emit-keyword [objx gen ^Keyword k]
+  (let [i (get (:keywords objx) k)]
+    (emit-constant objx gen i)))
+
 (declare emit-nil-expr)
 (declare emit-clear-locals)
 (declare host-expr-tag->class)
@@ -41,6 +67,7 @@
 (declare monitor-enter-expr-parser)
 (declare monitor-exit-expr-parser)
 (declare new-expr-parser)
+(declare new-constant-expr)
 
 (def char-map
   {\- "_",
@@ -916,3 +943,60 @@
           (if (not-nil? c)
             (new-static-method-expr *source* *line* tag c field-name args)
             (new-instance-method-expr *source* *line* tag instance field-name args)))))))
+
+(defrecord UnresolvedVarExpr [symbol]
+  Expr
+  (has-java-class? [this] false)
+  (get-java-class [this] (throw (IllegalArgumentException. "UnresolvedVarExpr has no Java class")))
+  (emit [this context objx gen]
+    )
+  (evaluate [this]
+    (throw (IllegalArgumentException. "UnresolvedVarExpr cannot be evalled"))))
+
+(defrecord NumberExpr [^Number n, id]
+  LiteralExpr
+  (value [this] n)
+  
+  Expr
+  (evaluate [this] n)
+  (emit [this context objx gen]
+    (if (not= :statement context)
+      (emit-constant objx gen id)))
+  (has-java-class? [this] true)
+  (get-java-class [this]
+    (cond
+     (instance? Integer n) Long/TYPE
+     (instance? Double n) Double/TYPE
+     (instance? Long n) Long/TYPE
+     :else (throw (IllegalStateException. (str "Unsupported Number type: "
+                                               (.getName (class n)))))))
+
+  MaybePrimitiveExpr
+  (can-emit-primitive [this] true)
+  (emit-unboxed [this context objx gen]
+    (cond
+     (instance? Integer n) (.push gen (.longValue n))
+     (instance? Double n) (.push gen (.doubleValue n))
+     (instance? Long n) (.push gen (.longValue n)))))
+
+(defn- register-constant [o]
+  (if (not (bound? #'*constants*))
+    -1
+    (let [i (.get *constant-ids* o)]
+      (if (not-nil? i)
+        i
+        (do
+          (var-set *constants* (conj *constants* o))
+          (.put *constant-ids* o (count *constants*))
+          (count *constants*))))))
+
+(defn new-number-expr [n]
+  (map->NumberExpr {:n n
+                    :id (register-constant n)}))
+
+(defn parse-number-expr [^Number form]
+  (if (or (instance? Integer form)
+          (instance? Double form)
+          (instance? Long form))
+    (new-number-expr form)
+    (new-constant-expr form)))
