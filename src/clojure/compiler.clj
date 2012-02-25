@@ -1150,3 +1150,64 @@
                           (persistent! m)))
 
      :else ret)))
+
+(defrecord SetExpr [keys]
+  Expr
+  (evaluate [this]
+    (let [ret (make-array Object (count keys))]
+      (doseq [i (count keys)]
+        (aset ret i (evaluate (nth keys i))))
+      (RT/set ret)))
+  (emit [this context objx gen]
+    (emit-args-as-array keys objx gen)
+    (.invokeStatic gen rt-type (Method/getMethod "clojure.lang.IPersistentSet set(Object[])"))
+    (pop-if-statement))
+  (has-java-class? [this] true)
+  (get-java-class [this] IPersistentSet))
+
+(defn new-set-expr [keys]
+  (->SetExpr keys))
+
+(defn parse-set-expr [context form]
+  (let [keys (into [] (map #(analyze (eval-or-expression context) %1) form))
+        constant (every? #(satisfies? LiteralExpr %1) keys)
+        ret (new-set-expr keys)]
+    (cond
+     (and (instance? IObj form) (not-nil? (meta form)))
+     (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
+
+     constant
+     (new-constant-expr (let [set (transient #{})]
+                          (doseq [i (range (count keys))]
+                            (conj! set (value (nth keys i))))
+                          (persistent! set)))
+     :else ret)))
+
+(defrecord VectorExpr [args]
+  Expr
+  (evaluate [this] (into [] (map #(evaluate %1) args)))
+  (emit [this context objx gen]
+    (let [vector-method (Method/getMethod "clojure.lang.IPersistentVector vector(Object[])")]
+      (emit-args-as-array args objx gen)
+      (.invokeStatic gen rt-type vector-method)
+      (pop-if-statement)))
+  (has-java-class? [this] true)
+  (get-java-class [this] IPersistentVector))
+
+(defn new-vector-expr [args]
+  (->VectorExpr args))
+
+(defn parse-vector-expr [context form]
+  (let [args (into [] (map #(analyze (eval-or-expression context) %1) form))
+        constant (every? #(satisfies? LiteralExpr %1) keys)
+        ret (new-set-expr keys)]
+    (cond
+     (and (instance? IObj form) (not-nil? (meta form)))
+     (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
+
+     constant
+     (new-constant-expr (let [rv (transient [])]
+                          (doseq [i (range (count args))]
+                            (conj! rv (value (nth args i))))
+                          (persistent! rv)))
+     :else ret)))
