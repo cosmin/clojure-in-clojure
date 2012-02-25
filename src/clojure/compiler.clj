@@ -4,7 +4,9 @@
   (:use [clojure.compiler primitives helpers])
   (:use [clojure.lang reflection])
   (:require [clojure.lang.intrinsics :as intrinsics])
-  (:import [clojure.lang IFn AFunction IPersistentMap IObj LazySeq ISeq RestFn AFn])
+  (:import [clojure.lang PersistentArrayMap PersistentHashSet PersistentVector PersistentList PersistentList$EmptyList])
+  (:import [clojure.lang IPersistentList IPersistentMap IPersistentVector IPersistentSet])
+  (:import [clojure.lang IFn AFunction IObj LazySeq ISeq RestFn AFn])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector Intrinsics])
   (:import [clojure.asm Type Opcodes])
@@ -956,7 +958,7 @@
 (defrecord NumberExpr [^Number n, id]
   LiteralExpr
   (value [this] n)
-  
+
   Expr
   (evaluate [this] n)
   (emit [this context objx gen]
@@ -1000,3 +1002,100 @@
           (instance? Long form))
     (new-number-expr form)
     (new-constant-expr form)))
+
+(def nil-expr
+  (reify
+    LiteralExpr
+    (value [this] nil)
+
+    Expr
+    (evaluate [this] nil)
+    (emit [this context objx gen]
+      (.visitInsn gen Opcodes/ACONST_NULL)
+      (pop-if-statement))
+    (has-java-class? [this] true)
+    (get-java-class [this] nil)))
+
+(defrecord BooleanExpr [val]
+  LiteralExpr
+  (value [this] (if val Boolean/TRUE Boolean/FALSE))
+
+  Expr
+  (evaluate [this] (if val Boolean/TRUE Boolean/FALSE))
+  (emit [this context objx gen]
+    (if val
+      (.getStatic gen boolean-object-type "TRUE" boolean-object-type)
+      (.getStatic gen boolean-object-type "FALSE" boolean-object-type))
+    (pop-if-statement))
+
+  (has-java-class? [this] true)
+  (get-java-class [this] Boolean))
+
+(def true-expr (->BooleanExpr true))
+(def false-expr (->BooleanExpr false))
+
+(defrecord StringExpr [str]
+  LiteralExpr
+  (value [this] str)
+
+  Expr
+  (evaluate [this] str)
+  (emit [this context objx gen]
+    (pop-if-statement))
+  (has-java-class? [this] true)
+  (get-java-class [this] String))
+
+(defn new-string-expr [s] (->StringExpr s))
+
+(defrecord EmptyExpr [coll]
+  Expr
+  (evaluate [this] coll)
+  (emit [this context objx gen]
+    (let [hashmap-type (Type/getType PersistentArrayMap)
+          hashset-type (Type/getType PersistentHashSet)
+          vector-type (Type/getType PersistentVector)
+          list-type (Type/getType PersistentList)
+          empty-list-type (Type/getType PersistentList$EmptyList)]
+      (cond
+       (list? coll) (.getStatic gen list-type "EMPTY" empty-list-type)
+       (vector? coll) (.getStatic gen vector-type "EMPTY" vector-type)
+       (map? coll) (.getStatic gen hashmap-type "EMPTY" hashmap-type)
+       (set? coll) (.getStatic gen hashset-type "EMPTY" hashset-type)
+       :else (throw (UnsupportedOperationException. "Unknown Collection type")))
+      (pop-if-statement)))
+  (has-java-class? [this] true)
+  (get-java-class [this]
+    (cond
+     (list? coll) IPersistentList
+     (vector? coll) IPersistentVector
+     (map? coll) IPersistentMap
+     (set? coll) IPersistentSet
+     :else (throw (UnsupportedOperationException. "Unknown Collection type")))))
+(defn new-empty-expr [coll] (->EmptyExpr coll))
+
+(defrecord ConstantExpr [v id]
+  Expr
+  (evaluate [this] v)
+  (emit [this context objx gen]
+    (emit-constant objx gen id)
+    (pop-if-statement))
+  (has-java-class? [this] (Modifier/isPublic (.getModifiers (class v))))
+  (get-java-class [this] (class v))
+
+  LiteralExpr
+  (value [this] v))
+
+(defn new-constant-expr [v]
+  (let [id (register-constant v)]
+    (map->ConstantExpr {:v v :id id})))
+
+(defn parse-constant-expr [context form]
+  (let [v (second form)]
+    (cond
+     (nil? v) nil-expr
+     (= true v) true-expr
+     (= false v) false-expr
+     (number? v) (parse-number-expr v)
+     (string? v) (new-string-expr v)
+     (and (coll? v) (= 0 (count v))) (new-empty-expr)
+     :else (new-constant-expr v))))
