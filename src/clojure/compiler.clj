@@ -152,7 +152,7 @@
 (defasmtype keyword-type Keyword)
 (defasmtype var-type Var)
 (defasmtype symbol-type Symbol)
-(defasmtype ifn_type IFn)
+(defasmtype ifn-type IFn)
 (defasmtype afunction-type AFunction)
 (defasmtype rt-type RT)
 (defasmtype numbers-type Numbers)
@@ -1001,6 +1001,8 @@
       (var-set *keyword-callsites* (conj *keyword-callsites* kw))
       (dec (count *keyword-callsites*)))))
 
+(declare register-protocol-callsite)
+
 (defn- site-name [n]
   (str "__site__" n))
 
@@ -1271,22 +1273,22 @@
         (.dup))
       (emit target :expression objx gen)
       (doto gen
-        (.invokeInterface ilookup-thunk-type (Method/getMethod "Object get(Object)")) ; target,thunk,result
-        (.dupX2) ; result,target,thunk,result
-        (.visitJumpInsn Opcodes/IF_ACMPEQ fault-label) ; result,target
-        (.pop) ; result
+        (.invokeInterface ilookup-thunk-type (Method/getMethod "Object get(Object)"))
+        (.dupX2)
+        (.visitJumpInsn Opcodes/IF_ACMPEQ fault-label)
+        (.pop)
         (.goTo end-label)
-        (.mark fault-label) ; result,target
-        (.swap) ; target,result
-        (.pop) ; target
-        (.dup) ; target,target
-        (.getStatic (:objtype objx) (site-name-static objx site-index) keyword-lookupsite-type) ; target,target,site
-        (.swap) ; target,site,target
-        (.invokeInterface ilookup-site-type (Method/getMethod "clojure.lang.ILookupThunk fault(Object)")) ; target,new-thunk
-        (.dup) ; target,new-thunk,new-thunk
-        (.putStatic (:objtype objx) (thunk-name-static objx site-index), ilookup-thunk-type) ; target,new-thunk
-        (.swap) ; new-thunk,target
-        (.invokeInterface ilookup-thunk-type, (Method/getMethod "Object get(Object)")) ; result
+        (.mark fault-label)
+        (.swap)
+        (.pop)
+        (.dup)
+        (.getStatic (:objtype objx) (site-name-static objx site-index) keyword-lookupsite-type)
+        (.swap)
+        (.invokeInterface ilookup-site-type (Method/getMethod "clojure.lang.ILookupThunk fault(Object)"))
+        (.dup)
+        (.putStatic (:objtype objx) (thunk-name-static objx site-index), ilookup-thunk-type)
+        (.swap)
+        (.invokeInterface ilookup-thunk-type, (Method/getMethod "Object get(Object)"))
         (.mark end-label))
       (pop-if-statement)))
   (has-java-class? [this] (not-nil? tag))
@@ -1300,3 +1302,174 @@
                              :line line
                              :site-index site-index
                              :source source})))
+
+(defrecord InstanceOfExpr [expr c]
+  Expr
+  (evaluate [this] (if (.isInstance c (evaluate expr)) true false))
+  (emit [this context objx gen]
+    (emit-unboxed this context objx gen)
+    (emit-box-return objx gen Boolean/TYPE)
+    (pop-if-statement))
+  (has-java-class? [this] true)
+  (get-java-class [this] Boolean/TYPE)
+
+  MaybePrimitiveExpr
+  (can-emit-primitive [this] true)
+  (emit-unboxed [this context objx gen]
+    (emit expr :expression objx gen)
+    (.instanceOf gen (Type/getType c))))
+
+(defn new-instance-of-expr [c expr]
+  (map->InstanceOfExpr {:c c :expr expr}))
+
+(defprotocol EmitProtoExpr
+  (emit-proto [this context objx gen])
+  (emit-args-and-call [this first-arg-to-emit context objx gen]))
+
+(defrecord InvokeExpr [fexpr tag line protocol? direct? site-index on-method
+                       ^IPersistentVector args
+                       ^String source
+                       ^Class protocol-on]
+  Expr
+  (evaluate [this]
+    (try
+      (let [fn (evaluate fexpr)
+            argvs (map #(evaluate %1) args)]
+        (.applyTo fn (seq argvs)))
+      (catch Throwable e
+        (if (instance? clojure.lang.Compiler$CompilerException e)
+          (throw e)
+          (throw (clojure.lang.Compiler$CompilerException. source line e))))))
+  (emit [this context objx gen]
+    (visit-line-number)
+    (if (protocol?)
+      (emit-proto this context objx gen)
+      (do
+        (emit fexpr :expression objx gen)
+        (.checkCast gen ifn-type)
+        (emit-args-and-call this 0 context objx gen)))
+    (pop-if-statement))
+  (has-java-class? [this] (not-nil? tag))
+  (get-java-class [this] (tag-to-class tag))
+
+  EmitProtoExpr
+  (emit-proto [this context objx gen]
+    (let [on-label (.newLabel gen)
+          call-label (.newLabel gen)
+          end-label (.newLabel gen)
+          v (:var fexpr)
+          e (first args)]
+      (emit e :expression objx gen)
+      (doto gen
+        (.dup)
+        (.invokeStatic util-type, (Method/getMethod "Class classOf(Object)"))
+        (.loadThis)
+        (.getField (:objtype objx) cached-class-name(objx site-index) class-type)
+        (.visitJumpInsn Opcodes/IF_ACMPEQ call-label))
+      (if (not-nil? protocol-on)
+        (doto gen
+          (.dup)
+          (.instanceOf (Type/getType protocol-on))
+          (.ifZCmp GeneratorAdapter/NE, on-label)))
+      (doto gen
+        (.dup)
+        (.invokeStatic util-type (Method/getMethod "Class classOf(Object)"))
+        (.loadThis)
+        (.swap)
+        (.putField (:objtype objx) (cached-class-name site-index) class-type)
+        (.mark call-label))
+      (emit-var objx gen v)
+      (doto gen
+        (.invokeVirtual var-type (Method/getMethod "Object getRawRoot()"))
+        (.swap))
+      (emit-args-and-call this 1 context objx gen)
+      (doto gen
+        (.goTo end-label)
+        (.mark on-label))
+      (if (not-nil? protocol-on)
+        (do
+          (emit-typed-args objx gen
+                           (.getParameterTypes on-method)
+                           (subvec args 1 (count args)))
+          (emit-clear-locals-if-return)
+          (let [m (Method. (.getName on-method)
+                           (Type/getReturnType on-method)
+                           (Type/getArgumentTypes on-method))]
+            (.invokeInterface gen (Type/getType protocol-on) m)
+            (emit-box-return objx gen (.getReturnType on-method)))))
+      (.mark gen end-label)))
+
+  (emit-args-and-call [this first-arg-to-emit context objx gen]
+    (doseq [i (range first-arg-to-emit (min max-positional-arity (count args)))]
+      (emit (nth args i) :expression objx gen))
+    (if (> (count args) max-positional-arity)
+      (let [rest-args (into [] (drop max-positional-arity args))]
+        (emit-args-as-array rest-args objx gen)))
+    (emit-clear-locals-if-return)
+    (.invokeInterface gen ifn-type (Method. "invoke" object-type (aget arg-types (min (inc max-positional-arity) (count args)))))))
+
+(defn new-invoke-expr [source line tag fexpr args]
+  (let [instance-values (transient {})]
+    (assoc! instance-values :source source)
+    (assoc! instance-values :fexpr fexpr)
+    (assoc! instance-values :args args)
+    (assoc! instance-values :line line)
+
+    (if (instance? VarExpr fexpr)
+      (let [fvar (:var fexpr)
+            pvar (get (meta fvar :protocol))]
+        (if (and (not-nil? pvar) (bound? *protocol-callsites*))
+          (let [protocol? true
+                site-index (register-protocol-callsite (:var fexpr))
+                pon (get (var-get pvar) :on)
+                protocol-on (maybe-class pon false)]
+            (assoc! instance-values :protocol? protocol?)
+            (assoc! instance-values :site-index site-index)
+            (assoc! instance-values :protocol-on protocol-on)
+            (if (not-nil? protocol-on)
+              (let [mmap (get (var-get pvar) :method-map)
+                    mmap-val (get mmap (keyword (.sym pvar)))]
+                (if (nil? mmap-val)
+                  (throw (IllegalArgumentException.
+                          (str "No method of interface: "
+                               (.getName protocol-on)
+                               " found for function: "
+                               (.sym fvar)
+                               " of protocol: "
+                               (.sym pvar)
+                               " (The protocol method may have been defined before and removed.)"))))
+                (let [mname (munge (.. mmap-val sym toString))
+                      methods (Reflector/getMethods protocol-on
+                                                    (dec (count args))
+                                                    mname
+                                                    false)]
+                  (if (not= 1 (.size methods))
+                    (throw (IllegalArgumentException.
+                            (str "No single method: "
+                                 mname
+                                 " of interface: "
+                                 (.getName protocol-on)
+                                 " found for function: "
+                                 (.sym fvar)
+                                 " of protocol: "
+                                 (.sym pvar)))))
+                  (assoc! instance-values :on-method (.get methods 0)))))))))
+    (cond (not-nil? tag)
+          (assoc! instance-values :tag tag)
+
+          (instance? VarExpr fexpr)
+          (let [arglists (get (meta (:var fexpr)) :arglists)
+                sig-tag (loop [s (next arglists)]
+                          (let [sig (first s)
+                                rest-offset (.indexOf sig '&)]
+                            (if (or (= (count args) (count sig))
+                                    (and (> rest-offset -1)
+                                         (>= (count args) (rest-offset))))
+                              (tag-of sig)
+                              (recur (next s)))))
+                tag (if (nil? sig-tag) (:tag fexpr) sig-tag)]
+            (assoc! instance-values :tag tag))
+
+          :else
+          (assoc! instance-values :tag nil))
+    (map->InvokeExpr (persistent! instance-values))))
