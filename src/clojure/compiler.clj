@@ -46,6 +46,48 @@
   (let [i (get (:keywords objx) k)]
     (emit-constant objx gen i)))
 
+(defn- prim-class [^Symbol sym]
+  (if (nil? sym)
+    nil
+    (condp = (name sym)
+      "int" Integer/TYPE
+      "long" Long/TYPE
+      "float" Float/TYPE
+      "double" Double/TYPE
+      "char" Character/TYPE
+      "short" Short/TYPE
+      "byte" Byte/TYPE
+      "boolean" Boolean/TYPE
+      "void" Void/TYPE
+      nil)))
+
+(defn- class-char [x]
+  (let [c (cond (class? x) x
+                (symbol? x) (prim-class x))]
+    (cond
+     (or (nil? c) (not (.isPrimitive c))) \O
+     (= Long/TYPE c) \L
+     (= Double/TYPE c) \D
+     :else (throw (IllegalArgumentException.
+                   "Only long and double primitives are supported")))))
+
+(defn- prim-interface [arglist]
+  (let [sb (StringBuilder.)]
+    (doseq [i (range (count arglist))]
+      (.append sb (class-char (tag-of (nth arglist i)))))
+    (.append sb (class-char (tag-of arglist)))
+    (let [ret (.toString sb)
+          prim? (or (.contains ret "L") (.contains ret "D"))]
+      (cond (and prim? (> (count arglist) 4))
+            (throw (IllegalArgumentException.
+                    "fns taking primitives support only 4 or fewer args"))
+
+            prim?
+            (str "clojure.lang.IFn$" ret)
+
+            :else
+            nil))))
+
 (declare emit-nil-expr)
 (declare emit-clear-locals)
 (declare host-expr-tag->class)
@@ -1473,3 +1515,46 @@
           :else
           (assoc! instance-values :tag nil))
     (map->InvokeExpr (persistent! instance-values))))
+
+(defn- check-if-instance-of-expr [context form fexpr]
+  (if (and (instance? VarExpr fexpr)
+             (= (:var fexpr) #'clojure.core/instance?))
+      (if (symbol? (second form))
+        (let [c (maybe-class (second form) false)]
+          (if (not-nil? c)
+            (new-instance-of-expr c (analyze context (third form))))))))
+
+(defn- check-if-invoke-prim-expr [context form fexpr]
+  (if (and (instance? VarExpr fexpr) (not= :eval context))
+    (let [v (:var fexpr)
+          arglists (get (meta v) :arglists)
+          arity (count (next form))]
+      (loop [s (next (seq arglists))]
+        (let [args (first s)]
+          (if (= arity (count args))
+            (let [primc (prim-interface args)]
+              (if (not-nil? primc)
+                (analyze context
+                         (apply list
+                                '.invokePrim
+                                (with-meta (first form) {:tag (symbol primc)})
+                                (next form)))))))))))
+
+(defn- check-if-keyword-invoke-expr [context form fexpr]
+  (if (and (instance? KeywordExpr fexpr)
+           (= 2 (count form))
+           (bound? *keyword-callsites*))
+    (let [target (analyze context (second form))]
+      (new-keyword-invoke-expr *source* *line* (tag-of form) fexpr target))))
+
+(defn parse-invoke-expr [ocontext form]
+  (let [context (eval-or-expression ocontext)
+        fexpr (analyze context (first form))]
+    (if-let [instance-of-expr (check-if-instance-of-expr context form fexpr)]
+      instance-of-expr
+      (if-let [invoke-prim (check-if-invoke-prim-expr context form fexpr)]
+        invoke-prim
+        (if-let [keyword-invoke-expr (check-if-keyword-invoke-expr context form fexpr)]
+          keyword-invoke-expr
+          (let [args (into [] (map #(analyze context (first %1)) (seq (next form))))]
+            (new-invoke-expr *source* *line* (tag-of form) fexpr args)))))))
