@@ -1,6 +1,7 @@
 (ns clojure.compiler.helpers
   (:use [clojure.utilities])
-  (:use [clojure.runtime :only (lookup-var)]))
+  (:use [clojure.runtime :only (lookup-var)])
+  (:import [clojure.lang IRecord]))
 
 
 (defn lookup-var-in-current-ns [sym]
@@ -37,3 +38,6 @@
 
 (defn assignable-from? [from assignable]
   (. from isAssignableFrom assignable))
+
+(defn record? [obj]
+  (instance? IRecord obj))

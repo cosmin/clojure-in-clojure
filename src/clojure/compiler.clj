@@ -4,7 +4,7 @@
   (:use [clojure.compiler primitives helpers])
   (:use [clojure.lang reflection])
   (:require [clojure.lang.intrinsics :as intrinsics])
-  (:import [clojure.lang ILookupSite ILookupThunk KeywordLookupSite])
+  (:import [clojure.lang ILookupSite ILookupThunk KeywordLookupSite IType])
   (:import [clojure.lang PersistentArrayMap PersistentHashSet PersistentVector PersistentList PersistentList$EmptyList])
   (:import [clojure.lang IPersistentList IPersistentMap IPersistentVector IPersistentSet])
   (:import [clojure.lang IFn AFunction IObj LazySeq ISeq RestFn AFn])
@@ -20,73 +20,6 @@
 (declare emit-var)
 (declare emit-var-value)
 
-(def ^:private const-prefix "const__")
-
-(defn- constant-type [objx id]
-  (let [constants (:constants objx)
-        o (nth constants id)
-        c (class o)]
-    (if (and (not-nil? c) (Modifier/isPublic (.getModifiers c)))
-      (cond
-       (assignable-from? LazySeq c) (Type/getType ISeq)
-       (= Keyword c) (Type/getType Keyword)
-       (assignable-from? RestFn c) (Type/getType RestFn)
-       (assignable-from? AFn c) (Type/getType AFn)
-       (= Var c) (Type/getType Var)
-       (= String c) (Type/getType String))
-      object-type)))
-
-(defn- constant-name [id]
-  (str const-prefix id))
-
-(defn- emit-constant [objx gen id]
-  (.getStatic gen (:objtype objx) (constant-name id) (constant-type id)))
-
-(defn- emit-keyword [objx gen ^Keyword k]
-  (let [i (get (:keywords objx) k)]
-    (emit-constant objx gen i)))
-
-(defn- prim-class [^Symbol sym]
-  (if (nil? sym)
-    nil
-    (condp = (name sym)
-      "int" Integer/TYPE
-      "long" Long/TYPE
-      "float" Float/TYPE
-      "double" Double/TYPE
-      "char" Character/TYPE
-      "short" Short/TYPE
-      "byte" Byte/TYPE
-      "boolean" Boolean/TYPE
-      "void" Void/TYPE
-      nil)))
-
-(defn- class-char [x]
-  (let [c (cond (class? x) x
-                (symbol? x) (prim-class x))]
-    (cond
-     (or (nil? c) (not (.isPrimitive c))) \O
-     (= Long/TYPE c) \L
-     (= Double/TYPE c) \D
-     :else (throw (IllegalArgumentException.
-                   "Only long and double primitives are supported")))))
-
-(defn- prim-interface [arglist]
-  (let [sb (StringBuilder.)]
-    (doseq [i (range (count arglist))]
-      (.append sb (class-char (tag-of (nth arglist i)))))
-    (.append sb (class-char (tag-of arglist)))
-    (let [ret (.toString sb)
-          prim? (or (.contains ret "L") (.contains ret "D"))]
-      (cond (and prim? (> (count arglist) 4))
-            (throw (IllegalArgumentException.
-                    "fns taking primitives support only 4 or fewer args"))
-
-            prim?
-            (str "clojure.lang.IFn$" ret)
-
-            :else
-            nil))))
 
 (declare emit-nil-expr)
 (declare emit-clear-locals)
@@ -257,6 +190,75 @@
     (if (not (nil? docstring))
       (assoc mm :doc docstring)
       mm)))
+
+(def ^:private const-prefix "const__")
+
+(defn- constant-type [objx id]
+  (let [constants (:constants objx)
+        o (nth constants id)
+        c (class o)]
+    (if (and (not-nil? c) (Modifier/isPublic (.getModifiers c)))
+      (cond
+       (assignable-from? LazySeq c) (Type/getType ISeq)
+       (= Keyword c) (Type/getType Keyword)
+       (assignable-from? RestFn c) (Type/getType RestFn)
+       (assignable-from? AFn c) (Type/getType AFn)
+       (= Var c) (Type/getType Var)
+       (= String c) (Type/getType String))
+      object-type)))
+
+(defn- constant-name [id]
+  (str const-prefix id))
+
+(defn- emit-constant [objx gen id]
+  (.getStatic gen (:objtype objx) (constant-name id) (constant-type id)))
+
+(defn- emit-keyword [objx gen ^Keyword k]
+  (let [i (get (:keywords objx) k)]
+    (emit-constant objx gen i)))
+
+(defn- prim-class [^Symbol sym]
+  (if (nil? sym)
+    nil
+    (condp = (name sym)
+      "int" Integer/TYPE
+      "long" Long/TYPE
+      "float" Float/TYPE
+      "double" Double/TYPE
+      "char" Character/TYPE
+      "short" Short/TYPE
+      "byte" Byte/TYPE
+      "boolean" Boolean/TYPE
+      "void" Void/TYPE
+      nil)))
+
+(defn- class-char [x]
+  (let [c (cond (class? x) x
+                (symbol? x) (prim-class x))]
+    (cond
+     (or (nil? c) (not (.isPrimitive c))) \O
+     (= Long/TYPE c) \L
+     (= Double/TYPE c) \D
+     :else (throw (IllegalArgumentException.
+                   "Only long and double primitives are supported")))))
+
+(defn- prim-interface [arglist]
+  (let [sb (StringBuilder.)]
+    (doseq [i (range (count arglist))]
+      (.append sb (class-char (tag-of (nth arglist i)))))
+    (.append sb (class-char (tag-of arglist)))
+    (let [ret (.toString sb)
+          prim? (or (.contains ret "L") (.contains ret "D"))]
+      (cond (and prim? (> (count arglist) 4))
+            (throw (IllegalArgumentException.
+                    "fns taking primitives support only 4 or fewer args"))
+
+            prim?
+            (str "clojure.lang.IFn$" ret)
+
+            :else
+            nil))))
+
 
 (defprotocol Expr
   (evaluate [this])
@@ -1219,7 +1221,8 @@
   (->MapExpr keyvals))
 
 (defn parse-map-expr [context form]
-  (let [keyvals (into [] (map #(analyze (eval-or-expression context) %1) (seq form)))
+  (let [mapseq (mapcat (fn [[k v]] [k v]) (seq form))
+        keyvals (into [] (map #(analyze (eval-or-expression context) %1) mapseq))
         constant (every? #(satisfies? LiteralExpr %1) keyvals)
         ret (new-map-expr keyvals)]
     (cond
@@ -1229,7 +1232,9 @@
      constant
      (new-constant-expr (let [m (transient {})]
                           (doseq [i (range 0 (count keyvals) 2)]
-                            (assoc! m (nth keyvals i) (nth keyvals (inc i))))
+                            (assoc! m
+                                    (value (nth keyvals i))
+                                    (value (nth keyvals (inc i)))))
                           (persistent! m)))
 
      :else ret)))
@@ -1282,8 +1287,8 @@
 
 (defn parse-vector-expr [context form]
   (let [args (into [] (map #(analyze (eval-or-expression context) %1) form))
-        constant (every? #(satisfies? LiteralExpr %1) keys)
-        ret (new-set-expr keys)]
+        constant (every? #(satisfies? LiteralExpr %1) args)
+        ret (new-vector-expr args)]
     (cond
      (and (instance? IObj form) (not-nil? (meta form)))
      (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
@@ -1558,3 +1563,110 @@
           keyword-invoke-expr
           (let [args (into [] (map #(analyze context (first %1)) (seq (next form))))]
             (new-invoke-expr *source* *line* (tag-of form) fexpr args)))))))
+
+(defn close-over [b method]
+  (if (and (not-nil? b) (not-nil? method))
+    (cond (nil? (get (:locals method) b))
+          (do
+            (assoc! (:closes (:objx method)) b b)
+            (close-over b (:parent method)))
+
+          (not-nil? *in-catch-finally*)
+          (conj! (:locals-used-in-catch-finally method) (.idx b)))))
+
+(defn reference-local [sym]
+  (if (not (bound? *local-env*))
+    nil
+    (let [b (get *local-env* sym)]
+      (if (not-nil? b)
+        (close-over b *method*))
+      b)))
+
+
+
+(defn macro? [op]
+  (cond (and (symbol? op) (not-nil? (reference-local op)))
+        nil
+
+        (or (symbol? op) (var? op))
+        (let [v (if (var? op)
+                  op
+                  (lookup-var op false false))]
+          (if (and (not-nil? v) (.isMacro v))
+            (if (and (not= *ns* (namespace v)) (not (.isPublic v)))
+              (throw (IllegalStateException. (str "var: " v " is not public")))
+              v)))))
+
+(defn is-inline [op arity]
+  ; no local inlines for now
+  (cond (and (symbol? op) (not-nil? (reference-local op)))
+        nil
+        (or (symbol? op) (var? op))
+        (let [v (if (var? op)
+                  op
+                  (lookup-var op false false))]
+          (if (and (not-nil? v) (.isMacro v))
+            (if (and (not= *ns* (namespace v)) (not (.isPublic v)))
+              (throw (IllegalStateException. (str "var: " v " is not public")))
+              (let [ret (get (meta v) :inline)]
+                (if (not-nil? ret)
+                  (let [arity-pred (get (meta v) :inline-arities)]
+                    (if (or (nil? arity-pred) (arity-pred arity))
+                      ret)))))))))
+
+(defn names-static-member [sym]
+  (and (not-nil? (namespace sym)) (nil? (namespace-for sym))))
+
+(defn preserve-tag [src dst]
+  (let [tag (tag-of src)]
+    (if (and (not-nil? tag) (instance? IObj dst))
+      (let [mmeta (meta dst)]
+        (with-meta dst (assoc mmeta :tag tag))))))
+
+(declare analyze-symbol)
+(defn analyze-seq [context form name]
+  nil
+  )
+(declare register-keyword)
+
+(defn- handle-lazy-seq [potentially-lazy-seq]
+  (if (instance? LazySeq potentially-lazy-seq)
+    (let [form (seq potentially-lazy-seq)]
+      (if (nil? form) () (seq form)))
+    potentially-lazy-seq))
+
+(defn analyze
+  ([context form] (analyze context form nil))
+  ([context form name]
+     (let [form (handle-lazy-seq form)]
+       (try
+         (condp = form
+           nil nil-expr
+           true true-expr
+           false false-expr
+           (cond
+             (symbol? form) (analyze-symbol form)
+             (keyword? form) (register-keyword form)
+             (number? form) (parse-number-expr form)
+             (string? form) (new-string-expr form)
+
+             (and (coll? form) (= 0 (count form)))
+             (let [ret (new-empty-expr form)]
+               (if (not-nil? (meta form))
+                 (new-meta-expr ret (parse-map-expr (eval-or-expression context)
+                                                    (meta form)))
+                 ret))
+
+
+
+             (seq? form) (analyze-seq context form name)
+             (vector? form) (parse-vector-expr context form)
+             (record? form) (new-constant-expr form)
+             (instance? IType form) (new-constant-expr form)
+             (map? form) (parse-map-expr context form)
+             (set? form) (parse-set-expr context form)))
+         (catch Throwable e
+           (throw e)
+           (if (instance? clojure.lang.Compiler$CompilerException e)
+             (throw e)
+             (throw (clojure.lang.Compiler$CompilerException. *source-path* *line* e))))))))
