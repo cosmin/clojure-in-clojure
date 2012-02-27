@@ -92,35 +92,6 @@
         ))))
 
 
-(def specials
-  {'def                      parse-def-expr
-   'loop*                    parse-let-expr
-   'recur                    parse-recur-expr
-   'if                       parse-if-expr
-   'case*                    parse-case-expr
-   'let*                     parse-let-expr
-   'letfn*                   parse-let-fn-expr
-   'do                       parse-body-expr
-   'fn*                      nil
-   'quote                    parse-constant-expr
-   'var                      parse-the-var-expr
-   'clojure.core/import*      parse-import-expr
-   '.                        parse-host-expr
-   'set!                     parse-assign-expr
-   'deftype*                 parse-new-instance-deftype-expr
-   'reify*                   parse-new-instance-reify-expr
-   'try                      parse-try-expr
-   'throw                    parse-throw-expr
-   'monitor-enter            parse-monitor-enter-expr
-   'monitor-exit             parse-monitor-exit-expr
-   'catch                    nil
-   'finally                  nil
-   'new                      parse-new-expr
-   '&                        nil
-   })
-
-(defn special? [sym] (contains? specials sym))
-
 (def max-positional-arity 20)
 
 (defmacro defasmtype [name klass]
@@ -1621,6 +1592,143 @@
           (let [args (into [] (map #(analyze context (first %1)) (seq (next form))))]
             (new-invoke-expr *source* *line* (tag-of form) fexpr args)))))))
 
+(defprotocol IfExprImpl
+  (emit-if-expr [this context objx gen emit-unboxed?]))
+
+(defrecord IfExpr [test-expr then-expr else-expr line]
+  IfExprImpl
+  (emit-if-expr [this context objx gen emit-unboxed?]
+    (let [null-label (.newLabel gen)
+          false-label (.newLabel gen)
+          end-label (.newLabel gen)]
+      (visit-line-number)
+      (try
+        (cond
+         (and (instance? StaticMethodExpr test-expr)
+              (can-emit-intrinsic-predicate test-expr))
+         (emit-intrinsic-predicate test-expr :expression objx gen false-label)
+
+         (= Boolean/TYPE (maybe-primitive-type test-expr))
+         (.ifZCmp gen (.EQ gen) false-label)
+
+         :else
+         (do
+           (emit test-expr :expression objx gen)
+           (doto gen
+             (.dup)
+             (.ifNull null-label)
+             (.getStatic boolean-object-type "FALSE" boolean-object-type)
+             (.visitJumpInsn Opcodes/IF_ACMPEQ false-label))))
+
+        (catch Exception e
+          (throw-runtime e)))
+
+      (if emit-unboxed?
+        (emit-unboxed then-expr context objx gen)
+        (emit then-expr context objx gen))
+
+      (doto gen
+        (.goTo end-label)
+        (.mark null-label)
+        (.pop)
+        (.mark false-label))
+
+      (if emit-unboxed?
+        (emit-unboxed else-expr context objx gen)
+        (emit else-expr context objx gen))
+      (.mark gen end-label)))
+  
+  Expr
+  (evaluate [this]
+    (let [t (evaluate test-expr)]
+      (if t
+        (evaluate then-expr)
+        (evaluate else-expr))))
+  (emit [this context objx gen]
+    (emit-if-expr this context objx gen false))
+  (has-java-class? [this]
+    (or (and (has-java-class? then-expr)
+             (has-java-class? else-expr)
+             (= (get-java-class then-expr) (get-java-class else-expr)))
+        (and (nil? (get-java-class then-expr))
+             (not (.isPrimitive (get-java-class else-expr))))
+        (and (nil? (get-java-class else-expr))
+             (not (.isPrimitive (get-java-class then-expr))))))
+  (get-java-class [this]
+    (let [then-class (get-java-class then-expr)]
+      (if then-class
+        then-class
+        (get-java-class else-expr))))
+    
+    
+  MaybePrimitiveExpr
+  (emit-unboxed [this context objx gen]
+    (emit-if-expr this context objx gen true))
+  (can-emit-primitive [this]
+    (try
+      (and (satisfies? MaybePrimitiveExpr then-expr)
+           (satisfies? MaybePrimitiveExpr else-expr)
+           (= (get-java-class then-expr) (get-java-class else-expr))
+           (can-emit-primitive then-expr)
+           (can-emit-primitive else-expr))
+      (catch Exception e
+        false))))
+
+(defn new-if-expr [line test-expr then-expr else-expr]
+  (map->IfExpr {:line line
+                :test-expr test-expr
+                :then-expr then-expr
+                :else-expr else-expr}))
+
+(deftype PathNode [type parent])
+(defn new-path-node [type parent]
+  (->PathNode type parent))
+
+(defn clear-path-root []
+  *clear-root*)
+
+(defn parse-if-expr [context form]
+  (cond
+   (> (count form) 4) (throw (RuntimeException. "Too many arguments to if"))
+   (< (count form) 3) (throw (RuntimeException. "Too few arguments to if"))
+   :else
+   (let [branch (new-path-node :branch *clear-path*)
+         test-expr (analyze (eval-or-expression context) (second form))
+         then-expr (binding [*clear-path* (new-path-node :path branch)]
+                     (analyze context (third form)))
+         else-expr (binding [*clear-path* (new-path-node :path branch)]
+                     (analyze context (fourth form)))]
+     (new-if-expr *line* test-expr then-expr else-expr))))
+
+(def specials
+  {'def                      parse-def-expr
+   'loop*                    parse-let-expr
+   'recur                    parse-recur-expr
+   'if                       parse-if-expr
+   'case*                    parse-case-expr
+   'let*                     parse-let-expr
+   'letfn*                   parse-let-fn-expr
+   'do                       parse-body-expr
+   'fn*                      nil
+   'quote                    parse-constant-expr
+   'var                      parse-the-var-expr
+   'clojure.core/import*      parse-import-expr
+   '.                        parse-host-expr
+   'set!                     parse-assign-expr
+   'deftype*                 parse-new-instance-deftype-expr
+   'reify*                   parse-new-instance-reify-expr
+   'try                      parse-try-expr
+   'throw                    parse-throw-expr
+   'monitor-enter            parse-monitor-enter-expr
+   'monitor-exit             parse-monitor-exit-expr
+   'catch                    nil
+   'finally                  nil
+   'new                      parse-new-expr
+   '&                        nil
+   })
+
+(defn special? [sym] (contains? specials sym))
+
 (defn close-over [b method]
   (if (and b method)
     (cond (nil? (get (:locals method) b))
@@ -1637,8 +1745,6 @@
       (when b
         (close-over b *method*))
       b)))
-
-
 
 (defn is-macro [op]
   (cond (and (symbol? op) (reference-local op))

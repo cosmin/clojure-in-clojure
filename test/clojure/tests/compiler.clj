@@ -17,5 +17,9 @@
   (is (= #clojure.compiler.StringExpr{:str "abcd"}
          (analyze :expression "abcd"))))
 
+(deftest test-if-expression
+  (is (= 1 (evaluate (analyze :expression '(if true 1 2)))))
+  (is (= 2 (evaluate (analyze :expression '(if false 1 2))))))
+
 (deftest test-macro-expansion
   (is (= '(if 1 (do 2 3)) (macroexpand-1 '(when 1 2 3)))))
