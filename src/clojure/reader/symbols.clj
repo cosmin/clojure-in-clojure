@@ -1,6 +1,6 @@
 (ns clojure.reader.symbols
   (:use clojure.utilities)
-  (:use clojure.runtime)
+  (:use [clojure.compiler :only (namespace-for)])
   (:import [java.util.regex Pattern Matcher]
            [clojure.lang Namespace Compiler Symbol Keyword Var]))
 

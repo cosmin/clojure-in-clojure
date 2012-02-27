@@ -1,5 +1,6 @@
 (ns clojure.compiler
-  (:refer-clojure :exclude [*source-path* *compile-path* *compile-files* munge])
+  (:refer-clojure :exclude [*file* *source-path* *compile-path* *compile-files*
+                            munge macroexpand-1 macroexpand])
   (:use [clojure utilities runtime])
   (:use [clojure.compiler primitives helpers])
   (:use [clojure.lang reflection])
@@ -10,6 +11,7 @@
   (:import [clojure.lang IFn AFunction IObj LazySeq ISeq RestFn AFn])
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector Intrinsics])
+  (:import [clojure.lang ArityException])
   (:import [clojure.asm Type Opcodes])
   (:import [clojure.asm.commons GeneratorAdapter Method])
   (:import [java.lang.reflect Constructor Modifier])
@@ -25,26 +27,27 @@
 (declare emit-clear-locals)
 (declare host-expr-tag->class)
 
-(declare def-expr-parser)
-(declare let-expr-parser)
-(declare recur-expr-parser)
-(declare if-expr-parser)
-(declare case-expr-parser)
-(declare let-expr-parser)
-(declare let-fn-expr-parser)
-(declare body-expr-parser)
-(declare constant-expr-parser)
-(declare the-var-expr-parser)
-(declare import-expr-parser)
-(declare host-expr-parser)
-(declare assign-expr-parser)
-(declare new-instance-deftype-expr-parser)
-(declare new-instance-reify-expr-parser)
-(declare try-expr-parser)
-(declare throw-expr-parser)
-(declare monitor-enter-expr-parser)
-(declare monitor-exit-expr-parser)
-(declare new-expr-parser)
+(declare parse-fn-expr)
+(declare parse-def-expr)
+(declare parse-let-expr)
+(declare parse-recur-expr)
+(declare parse-if-expr)
+(declare parse-case-expr)
+(declare parse-let-expr)
+(declare parse-let-fn-expr)
+(declare parse-body-expr)
+(declare parse-constant-expr)
+(declare parse-the-var-expr)
+(declare parse-import-expr)
+(declare parse-host-expr)
+(declare parse-assign-expr)
+(declare parse-new-instance-deftype-expr)
+(declare parse-new-instance-reify-expr)
+(declare parse-try-expr)
+(declare parse-throw-expr)
+(declare parse-monitor-enter-expr)
+(declare parse-monitor-exit-expr)
+(declare parse-new-expr)
 (declare new-constant-expr)
 (declare new-meta-expr)
 
@@ -79,40 +82,40 @@
   (apply str (map #(char-map % %) name)))
 
 (defn is-field? [c instance sym]
-  (if (represents-static? sym)
-    (if (not-nil? c)
+  (when (represents-static? sym)
+    (if c
       (= 0 (.size (Reflector/getMethods c 0 (munge (name sym)) true)))
-      (if (and (not-nil? instance)
+      (if (and instance
                (.hasJavaClass instance)
-               (not-nil? (.getJavaClass instance)))
+               (.getJavaClass instance))
         (= 0 (.size (Reflector/getMethods (.getjavaclass instance) 0 (munge (name sym)) false)))
         ))))
 
 
 (def specials
-  {'def                      def-expr-parser
-   'loop*                    let-expr-parser
-   'recur                    recur-expr-parser
-   'if                       if-expr-parser
-   'case*                    case-expr-parser
-   'let*                     let-expr-parser
-   'letfn*                   let-fn-expr-parser
-   'do                       body-expr-parser
-   'fn                       nil
-   'quote                    constant-expr-parser
-   'var                      the-var-expr-parser
-   'clojure.core/import*      import-expr-parser
-   '.                        host-expr-parser
-   'set!                     assign-expr-parser
-   'deftype*                 new-instance-deftype-expr-parser
-   'reify*                   new-instance-reify-expr-parser
-   'try                      try-expr-parser
-   'throw                    throw-expr-parser
-   'monitor-enter            monitor-enter-expr-parser
-   'monitor-exit             monitor-exit-expr-parser
+  {'def                      parse-def-expr
+   'loop*                    parse-let-expr
+   'recur                    parse-recur-expr
+   'if                       parse-if-expr
+   'case*                    parse-case-expr
+   'let*                     parse-let-expr
+   'letfn*                   parse-let-fn-expr
+   'do                       parse-body-expr
+   'fn*                      nil
+   'quote                    parse-constant-expr
+   'var                      parse-the-var-expr
+   'clojure.core/import*      parse-import-expr
+   '.                        parse-host-expr
+   'set!                     parse-assign-expr
+   'deftype*                 parse-new-instance-deftype-expr
+   'reify*                   parse-new-instance-reify-expr
+   'try                      parse-try-expr
+   'throw                    parse-throw-expr
+   'monitor-enter            parse-monitor-enter-expr
+   'monitor-exit             parse-monitor-exit-expr
    'catch                    nil
    'finally                  nil
-   'new                      new-expr-parser
+   'new                      parse-new-expr
    '&                        nil
    })
 
@@ -185,9 +188,9 @@
 (def ^:dynamic *clear-sites* nil)
 
 (defn meta-add-source-line-doc [mm docstring]
-  (let [source-path (if (nil? *source-path*) "NO_SOURCE_FILE" *source-path*)
+  (let [source-path (if-not *source-path* "NO_SOURCE_FILE" *source-path*)
         mm (assoc mm :line *line* :file source-path)]
-    (if (not (nil? docstring))
+    (if docstring
       (assoc mm :doc docstring)
       mm)))
 
@@ -197,7 +200,7 @@
   (let [constants (:constants objx)
         o (nth constants id)
         c (class o)]
-    (if (and (not-nil? c) (Modifier/isPublic (.getModifiers c)))
+    (when (and c (Modifier/isPublic (.getModifiers c)))
       (cond
        (assignable-from? LazySeq c) (Type/getType ISeq)
        (= Keyword c) (Type/getType Keyword)
@@ -218,8 +221,7 @@
     (emit-constant objx gen i)))
 
 (defn- prim-class [^Symbol sym]
-  (if (nil? sym)
-    nil
+  (when sym
     (condp = (name sym)
       "int" Integer/TYPE
       "long" Long/TYPE
@@ -242,6 +244,13 @@
      :else (throw (IllegalArgumentException.
                    "Only long and double primitives are supported")))))
 
+(defn tag-of [o]
+  (let [tag (:tag (meta o))]
+    (cond
+     (symbol? tag) tag
+     (string? tag) (symbol nil tag)
+     :else nil)))
+
 (defn- prim-interface [arglist]
   (let [sb (StringBuilder.)]
     (doseq [i (range (count arglist))]
@@ -259,6 +268,72 @@
             :else
             nil))))
 
+(defn namespace-for
+  ([^Symbol sym] (namespace-for *ns* sym))
+  ([^Namespace inns, ^Symbol sym]
+     (let [ns-sym (symbol (.ns sym))
+           ns (.lookupAlias inns ns-sym )]
+       (if (nil? ns)
+         (Namespace/find ns-sym)
+         ns))))
+
+(defn- lookup-var* [sym intern-new?]
+  (cond (namespace sym)
+        (let [ns (namespace-for sym)]
+          (if (nil? ns)
+            nil
+            (let [name (symbol (name nil sym))]
+              (if (and intern-new? (= ns *ns*))
+                (.intern *ns* name)
+                (.findInternedVar ns name)))))
+
+        (= sym 'ns) #'clojure.core/ns
+        (= sym 'in-ns) #'clojure.core/in-ns
+        :else
+        (let [o (.getMapping *ns* sym)]
+          (cond (nil? o)
+                (when intern-new?
+                  (.intern *ns* (symbol (name sym))))
+
+                (var? o) o
+                :else (throw (RuntimeException. (str "Expecting var, but "
+                                                     sym
+                                                     " is mapped to "
+                                                     o)))))))
+
+(defn- register-constant [o]
+  (if-not (bound? #'*constants*)
+    -1
+    (let [i (.get *constant-ids* o)]
+      (if i
+        i
+        (do
+          (var-set *constants* (conj *constants* o))
+          (.put *constant-ids* o (count *constants*))
+          (count *constants*))))))
+
+(defn register-var [v]
+  (if (bound? #'*vars*)
+    (let [id (get *vars* v)]
+      (if (nil? id)
+        (var-set *vars* (assoc *vars* v (register-constant v)))))))
+
+(defn lookup-var
+  ([sym intern-new?] (lookup-var sym intern-new? true))
+  ([sym intern-new? register-macro?]
+     (let [var (lookup-var* sym intern-new?)]
+       (when (and var (or (not (.isMacro var)) register-macro?))
+         (register-var var))
+       var)))
+
+(defn lookup-var-in-current-ns [sym]
+  (let [v (lookup-var sym true)]
+    (if (nil? v)
+      (throw (RuntimeException. "Can't refer to qualified var that doesn't exist"))
+      (if (not (= (namespace v) *ns*))
+        (if (nil? (namespace sym))
+          (.intern *ns* sym)
+          (throw (RuntimeException. "Can't create defs outside of current ns")))))))
 
 (defprotocol Expr
   (evaluate [this])
@@ -290,9 +365,9 @@
                     ^String source, ^long line]
   Expr
   (evaluate [this]
-    (if init-provided?
+    (when init-provided?
       (.bindRoot var (evaluate init)))
-    (if (not (nil? meta))
+    (when meta
       (.setMeta (evaluate meta)))
     (.setDynamic var dynamic?))
   (emit [this context objx gen]
@@ -306,31 +381,29 @@
         (do
           (.push gen dynamic?)
           (.invokeVirtual gen var-type set-dynamic-method)))
-      (if (not (nil? meta))
-        (do
-          (.dup gen)
-          (emit meta :expression objx gen)
-          (.checkCast gen ipersistent-map-type)
-          (.invokeVirtual gen var-type set-meta-method)))
-      (if init-provided?
-        (do
-          (.dup gen)
-          (if (instance? FnExpr init)
-            (.emitForDefn init objx gen)
-            (emit init :expression objx gen))
-          (.invokeVirtual gen var-type bind-root-method)))
+      (when meta
+        (.dup gen)
+        (emit meta :expression objx gen)
+        (.checkCast gen ipersistent-map-type)
+        (.invokeVirtual gen var-type set-meta-method))
+      (when init-provided?
+        (.dup gen)
+        (if (instance? FnExpr init)
+          (.emitForDefn init objx gen)
+          (emit init :expression objx gen))
+        (.invokeVirtual gen var-type bind-root-method))
       (pop-if-statement)))
   (has-java-class? [init] true)
   (get-java-class [init] Var))
 
-(defn def-expr-parser
+(defn parse-def-expr
   ([context form]
      (if (and (= 4 (count form)) (string? (third form)))
-       (def-expr-parser
+       (parse-def-expr
          context
          (list (first form) (second form) (fourth form))
          (third form))
-       (def-expr-parser context form nil)))
+       (parse-def-expr context form nil)))
   ([context form docstring]
      (cond
       (> (count form) 3)
@@ -345,7 +418,7 @@
            v (lookup-var-in-current-ns sym)
            mm (meta sym)
            dynamic? (:dynamic mm)]
-       (if (dynamic?)
+       (when dynamic?
          (.setDynamic v))
        (if (and (.startsWith (name sym) "*")
                 (.endsWith (name sym) "*")
@@ -357,7 +430,7 @@
                "Please either indicate ^:dynamic %1$s "
                "or change the name. (%2$s:%3$d)\n")
           sym *source-path*, *line*))
-       (if (:arglists mm)
+       (when (:arglists mm)
          (let [vm (meta v)]
            (.setMeta v (assoc vm :arglists (second (:arglists mm))))))
        (let [mm (meta-add-source-line-doc mm docstring)
@@ -380,7 +453,7 @@
   (has-java-class? [this] (has-java-class? val))
   (get-java-class [this] (get-java-class val)))
 
-(defn assign-expr-parser [context form]
+(defn parse-assign-expr [context form]
   (if  (not= 3 (count form))
     (throw (IllegalArgumentException. "Malformed assignment, expecting (set! target val)"))
     (let [target (analyze :expression (second form))]
@@ -395,9 +468,9 @@
   (evaluate [this] (.deref var))
   (emit [this context objx gen]
     (emit-var-value objx gen var)
-    (if (== :statement context)
+    (when (= :statement context)
       (.pop gen)))
-  (has-java-class? [this] (not (nil? tag)))
+  (has-java-class? [this] (not-nil? tag))
   (get-java-class [this] (host-expr-tag->class tag))
 
   AssignableExpr
@@ -414,16 +487,16 @@
   (evaluate [this] var)
   (emit [this context objx gen]
     (emit-var objx gen var)
-    (if (= :statement context)
+    (when (= :statement context)
       (.pop gen)))
   (has-java-class? [this] true)
   (get-java-class [this] Var))
 
 
-(defn the-var-expr-parser [context form]
+(defn parse-the-var-expr [context form]
   (let [sym (second form)
         v (lookup-var sym false)]
-    (if (not (nil? v))
+    (if v
       (->TheVarExpr v)
       (throw (RuntimeException. (str "Unable to resolve var: " sym
                                      " in this context"))))))
@@ -437,7 +510,7 @@
   (evaluate [this] k)
   (emit [this context objx gen]
     (emit-keyword objx gen k)
-    (if (= :statement context)
+    (when (= :statement context)
       (.pop gen)))
   (has-java-class? [this] true)
   (get-java-class [this] Keyword))
@@ -465,11 +538,11 @@
   (has-java-class? [this] false)
   (get-java-class [this] (throw (IllegalArgumentException. "ImportExpr has no Java class"))))
 
-(defn import-expr-parser [context form]
+(defn parse-import-expr [context form]
   (->ImportExpr (second form)))
 
 (defn emit-box-return [objx, ^GeneratorAdapter gen, ^Class return-type]
-  (if (.isPrimitive return-type)
+  (when (.isPrimitive return-type)
     (condp = return-type
       Boolean/TYPE
       (do
@@ -494,13 +567,11 @@
 
 (defn- maybe-primitive-type [e]
   (try
-    (if (and (satisfies? MaybePrimitiveExpr e)
+    (when (and (satisfies? MaybePrimitiveExpr e)
              (has-java-class? e)
              (can-emit-primitive e))
-      (do
-        (let [c (get-java-class e)]
-          (if (primitive? c)
-            c))))
+      (let [c (get-java-class e)]
+        (when (primitive? c) c)))
     (catch Exception ex
       (throw-runtime ex))))
 
@@ -595,7 +666,7 @@
 
    (symbol? form)
    (let [sym form]
-     (if (nil? (namespace sym)) ; if ns-qualified can't be classname
+     (when-not (namespace sym) ; if ns-qualified can't be classname
        (cond
         (= sym *compile-stub-sym*)
         *compile-stub-class*
@@ -621,10 +692,10 @@
 
 (defn tag-to-class [tag]
   (let [c (maybe-class tag true)
-        array-class (if (symbol? tag)
+        array-class (when (symbol? tag)
                       (let [sym tag]
                         ; if ns-qualified can't be classname
-                        (if (nil? (namespace sym))
+                        (when-not (namespace sym)
                           (condp = (name sym)
                             "objects" object-array-class
                             "ints" int-array-class
@@ -635,9 +706,9 @@
                             "shorts" short-array-class
                             "bytes" byte-array-class
                             "booleans" boolean-array-class))))]
-    (if (not-nil? array-class)
+    (if array-class
       array-class
-      (if (not-nil? c)
+      (if c
         c
         (throw (IllegalArgumentException.
                 (str "Unable to resolve classname: " tag)))))))
@@ -648,11 +719,9 @@
         with-java-class (filter #(has-java-class? %1) without-throw)
         first-match (first with-java-class)
         second-match (second with-java-class)]
-    (if (not-nil? first-match)
-      (if (not-nil? second-match)
-        nil
-        first-match
-        ))))
+    (when first-match
+      (when-not second-match
+        first-match))))
 
 (defrecord StaticFieldExpr [field-name c field tag line]
   Expr
@@ -661,10 +730,10 @@
     (visit-line-number)
     (.getStatic gen (Type/getType c) field-name (Type/getType (.getType field)))
     (emit-box-return objx gen (.getType field))
-    (if (= :statement context)
+    (when (= :statement context)
       (.pop gen)))
   (has-java-class? [this] true)
-  (get-java-class [this] (if (not-nil? tag) (tag-to-class tag) (.getType field)))
+  (get-java-class [this] (if tag (tag-to-class tag) (.getType field)))
 
   MaybePrimitiveExpr
   (can-emit-primitive [this] (primitive? (.getType field)))
@@ -681,7 +750,7 @@
     (.dup gen)
     (emit-unbox-arg objx gen (.getType field))
     (.putStatic gen (Type/getType c) field-name (Type/getType (.getType field)))
-    (if (= :statement context)
+    (when (= :statement context)
       (.pop gen))))
 
 (defn new-static-field-expr [line c field-name tag]
@@ -711,7 +780,7 @@
     (Reflector/invokeNoArgInstanceMember (evaluate target) field-name))
   (emit [this context objx gen]
     (visit-line-number)
-    (if (and (not-nil? target-class) (not-nil? field))
+    (if (and target-class field)
       (do (emit target :expression objx gen)
           (doto gen
             (.checkCast (Type/getType target-class))
@@ -719,28 +788,28 @@
                        field-name
                        (Type/getType (.getType field))))
           (emit-box-return objx gen (.getType field))
-          (if (= :statement context)
+          (when (= :statement context)
             (.pop gen)))
       (do (emit target :expression objx gen)
           (doto gen
             (.push field-name)
             (.invokeStatic reflector-type invoke-no-arg-instance-member))
-          (if (= :statement context)
+          (when (= :statement context)
             (.pop gen)))))
-  (has-java-class? [this] (or (not-nil? field) (not-nil? tag)))
+  (has-java-class? [this] (or field tag))
   (get-java-class [this]
-    (if (not-nil? tag)
+    (if tag
       (tag-to-class tag)
       (.getType field)))
 
   MaybePrimitiveExpr
   (can-emit-primitive [this]
-    (and (not-nil? target-class)
-         (not-nil? field)
+    (and target-class
+         field
          (primitive? (.getType field))))
   (emit-unboxed [this context objx gen]
     (visit-line-number)
-    (if (and (not-nil? target-class) (not-nil? field))
+    (if (and target-class field)
       (do (emit target :expression objx gen)
           (doto gen
             (.checkCast (Type/getType target-class))
@@ -754,7 +823,7 @@
     (Reflector/setInstanceField (evaluate target) field-name (evaluate val)))
   (emit-assign [this context objx gen val]
     (visit-line-number)
-    (if (and (not-nil? target-class) (not-nil? field))
+    (if (and target-class field)
       (do (emit target :expression objx gen)
           (.checkCast gen (Type/getType target-class))
           (emit val :expression objx gen)
@@ -776,7 +845,7 @@
 
 (defn new-instance-field-expr [line target field-name tag]
   (let [target-class (if (has-java-class? target) (get-java-class target))
-        field (if (not-nil? target-class) (Reflector/getField target-class field-name false))]
+        field (if target-class (Reflector/getField target-class field-name false))]
     (if (and (nil? field) clojure.core/*warn-on-reflection*)
       (print-to-error-writer "Reflection warning, %s:%d - reference to field %s can't be resolved.\n" *source-path* line field-name))
     (map->InstanceFieldExpr {:target target
@@ -794,7 +863,7 @@
       (let [argvals (make-array Object (count args))]
         (doseq [i (range (count args))]
           (aset argvals (evaluate (nth args i))))
-        (if (not-nil? method)
+        (if method
           (let [ms (LinkedList.)]
             (.add ms method)
             (invoke-matching-method method-name ms nil argvals))
@@ -805,7 +874,7 @@
           (throw (clojure.lang.Compiler$CompilerException. source line e))))))
   (emit [this context objx gen]
     (visit-line-number)
-    (if (not-nil? method)
+    (if method
       (do
         (emit-typed-args objx gen (.getParameterTypes method) args)
         (emit-clear-locals-if-return)
@@ -831,20 +900,19 @@
         (emit-clear-locals-if-return)
         (.invokeStatic gen reflector-type invoke-static-method-method)
         (pop-if-statement))))
-  (has-java-class? [this] (or (not-nil? method) (not-nil? tag)))
+  (has-java-class? [this] (or method tag))
   (get-java-class [this]
-    (if (not-nil? tag)
+    (if tag
       (tag-to-class tag)
       (.getReturnType method)))
 
   MaybeIntrinsicPredicate
   (can-emit-intrinsic-predicate [this]
-    (and (not-nil? method)
-         (not-nil? (get intrinsics/preds (.toString method)))))
+    (and method (get intrinsics/preds (.toString method))))
 
   (emit-intrinsic-predicate [this context objx gen false-label]
     (visit-line-number)
-    (if (nil? method)
+    (if-not method
       (throw (UnsupportedOperationException. "Unboxed emit of unknown member"))
       (do
         (emit-typed-args objx gen (.getParameterTypes method) args)
@@ -856,16 +924,16 @@
 
   MaybePrimitiveExpr
   (can-emit-primitive [this]
-    (and (not-nil? method) (primitive? (.getReturnType method))))
+    (and method (primitive? (.getReturnType method))))
   (emit-unboxed [this context objx gen]
     (visit-line-number)
-    (if (nil? method)
+    (if-not method
       (throw (UnsupportedOperationException. "Unboxed emit of unknown member"))
       (do
         (emit-typed-args objx gen (.getParameterTypes method) args)
         (emit-clear-locals-if-return)
         (let [ops (get intrinsics/preds (.toString method))]
-          (if (not-nil? ops)
+          (if ops
             (if (instance? object-array-class ops)
               (doseq [op ops]
                 (.visitInsn gen op))
@@ -901,7 +969,7 @@
             argvals (make-array Object (count args))]
         (doseq [i (range (count args))]
           (aset argvals i (evaluate (nth args i))))
-        (if (not-nil? method)
+        (when method
           (let [ms (LinkedList.)]
             (.add ms method)
             (invoke-matching-method method-name ms targetval argvals)))
@@ -912,7 +980,7 @@
           (throw (clojure.lang.Compiler$CompilerException. source line e))))))
   (emit [this context objx gen]
     (.visitLineNumber line (.mark gen))
-    (if (not-nil? method)
+    (when method
       (let [type (Type/getType (.getDeclaringClass method))]
         (emit target :expression objx gen)
         (.checkCast gen type)
@@ -925,16 +993,16 @@
         (emit-box-return objx gen (.getReturnType method)))))
   (has-java-class? [this] (not (and (nil? method) (nil? tag))))
   (get-java-class [this]
-    (if (not-nil? tag)
+    (if tag
       (tag-to-class tag)
       (.getReturnType method)))
 
   MaybePrimitiveExpr
   (can-emit-primitive [this]
-    (and (not-nil? method) (primitive? (.getReturnType method))))
+    (and method (primitive? (.getReturnType method))))
   (emit-unboxed [this context objx gen]
     (visit-line-number)
-    (if (nil? method)
+    (if-not method
       (throw (UnsupportedOperationException. "Unboxed emit of unknown member"))
       (let [type (Type/getType (.getDeclaringClass method))]
         (emit target :expression objx gen)
@@ -947,13 +1015,13 @@
             (.invokeVirtual gen type m)))))))
 
 (defn new-instance-method-expr [source line tag target method-name args]
-  (let [method (if (and (has-java-class? target) (not-nil? (get-java-class target)))
+  (let [method (when (and (has-java-class? target) (get-java-class target))
                  (let [methods (Reflector/getMethods (get-java-class target)
                                                      (count args)
                                                      method-name
                                                      false)]
                    (get-method-with-name-and-args methods method-name args)))]
-    (if (and (nil? method) clojure.core/*warn-on-reflection*)
+    (when (and (nil? method) clojure.core/*warn-on-reflection*)
       (print-to-error-writer "Reflection warning, %s:%d - call to %s can't be resolved.\n" *source-path* line method-name))
     (map->InstanceMethodExpr {:target target
                               :method-name method-name
@@ -968,27 +1036,27 @@
     (throw (IllegalArgumentException. "malformed member expression, expecting (. target member ...)")))
   (let [c (maybe-class (second form false))
         icontext (eval-or-expression context)
-        instance (if (nil? c) (analyze icontext (second form)))
+        instance (when-not c (analyze icontext (second form)))
         third-form (third form)
         maybe-field (and (= 3 (count form)) (symbol? third-form))
-        field? (if maybe-field (is-field? c instance third-form))]
+        field? (when maybe-field (is-field? c instance third-form))]
     (if field?
       (let [sym (if (represents-static? third-form)
                   (symbol (.substring (name third-form) 1))
                   third-form)
             tag (tag-of form)
             field-name (munge (name sym))]
-        (if (not-nil? c)
+        (if c
           (new-static-field-expr *line* c field-name tag)
           (new-instance-field-expr *line* instance field-name tag)))
       (let [call (if (seq? third-form) third-form (next (next form)))]
-        (if (not (symbol? (first call)))
+        (when-not (symbol? (first call))
           (throw (IllegalArgumentException. "Malformed member expression")))
         (let [sym (first call)
               tag (tag-of form)
               args (into [] (map #(analyze (eval-or-expression context) %1)))
               field-name (munge (name sym))]
-          (if (not-nil? c)
+          (if c
             (new-static-method-expr *source* *line* tag c field-name args)
             (new-instance-method-expr *source* *line* tag instance field-name args)))))))
 
@@ -1008,7 +1076,7 @@
   Expr
   (evaluate [this] n)
   (emit [this context objx gen]
-    (if (not= :statement context)
+    (when-not (= :statement context)
       (emit-constant objx gen id)))
   (has-java-class? [this] true)
   (get-java-class [this]
@@ -1027,19 +1095,9 @@
      (instance? Double n) (.push gen (.doubleValue n))
      (instance? Long n) (.push gen (.longValue n)))))
 
-(defn- register-constant [o]
-  (if (not (bound? #'*constants*))
-    -1
-    (let [i (.get *constant-ids* o)]
-      (if (not-nil? i)
-        i
-        (do
-          (var-set *constants* (conj *constants* o))
-          (.put *constant-ids* o (count *constants*))
-          (count *constants*))))))
 
 (defn- register-keyword-callsite [kw]
-  (if (not (bound? *keyword-callsites*))
+  (if-not (bound? #'*keyword-callsites*)
     (throw (IllegalAccessError. "KEYWORD_CALLSITES is not bound"))
     (do
       (var-set *keyword-callsites* (conj *keyword-callsites* kw))
@@ -1104,10 +1162,10 @@
 
 (defrecord BooleanExpr [val]
   LiteralExpr
-  (value [this] (if val Boolean/TRUE Boolean/FALSE))
+  (value [this] (if val true false))
 
   Expr
-  (evaluate [this] (if val Boolean/TRUE Boolean/FALSE))
+  (evaluate [this] (if val true false))
   (emit [this context objx gen]
     (if val
       (.getStatic gen boolean-object-type "TRUE" boolean-object-type)
@@ -1226,7 +1284,7 @@
         constant (every? #(satisfies? LiteralExpr %1) keyvals)
         ret (new-map-expr keyvals)]
     (cond
-     (and (instance? IObj form) (not-nil? (meta form)))
+     (and (instance? IObj form) (meta form))
      (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
 
      constant
@@ -1261,7 +1319,7 @@
         constant (every? #(satisfies? LiteralExpr %1) keys)
         ret (new-set-expr keys)]
     (cond
-     (and (instance? IObj form) (not-nil? (meta form)))
+     (and (instance? IObj form) (meta form))
      (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
 
      constant
@@ -1290,7 +1348,7 @@
         constant (every? #(satisfies? LiteralExpr %1) args)
         ret (new-vector-expr args)]
     (cond
-     (and (instance? IObj form) (not-nil? (meta form)))
+     (and (instance? IObj form) (meta form))
      (new-meta-expr ret (parse-map-expr (eval-or-expression context) (meta form)))
 
      constant
@@ -1413,7 +1471,7 @@
         (.loadThis)
         (.getField (:objtype objx) cached-class-name(objx site-index) class-type)
         (.visitJumpInsn Opcodes/IF_ACMPEQ call-label))
-      (if (not-nil? protocol-on)
+      (when protocol-on
         (doto gen
           (.dup)
           (.instanceOf (Type/getType protocol-on))
@@ -1433,23 +1491,22 @@
       (doto gen
         (.goTo end-label)
         (.mark on-label))
-      (if (not-nil? protocol-on)
-        (do
-          (emit-typed-args objx gen
-                           (.getParameterTypes on-method)
-                           (subvec args 1 (count args)))
-          (emit-clear-locals-if-return)
-          (let [m (Method. (.getName on-method)
-                           (Type/getReturnType on-method)
-                           (Type/getArgumentTypes on-method))]
-            (.invokeInterface gen (Type/getType protocol-on) m)
-            (emit-box-return objx gen (.getReturnType on-method)))))
+      (when protocol-on
+        (emit-typed-args objx gen
+                         (.getParameterTypes on-method)
+                         (subvec args 1 (count args)))
+        (emit-clear-locals-if-return)
+        (let [m (Method. (.getName on-method)
+                         (Type/getReturnType on-method)
+                         (Type/getArgumentTypes on-method))]
+          (.invokeInterface gen (Type/getType protocol-on) m)
+          (emit-box-return objx gen (.getReturnType on-method))))
       (.mark gen end-label)))
 
   (emit-args-and-call [this first-arg-to-emit context objx gen]
     (doseq [i (range first-arg-to-emit (min max-positional-arity (count args)))]
       (emit (nth args i) :expression objx gen))
-    (if (> (count args) max-positional-arity)
+    (when (> (count args) max-positional-arity)
       (let [rest-args (into [] (drop max-positional-arity args))]
         (emit-args-as-array rest-args objx gen)))
     (emit-clear-locals-if-return)
@@ -1462,10 +1519,10 @@
     (assoc! instance-values :args args)
     (assoc! instance-values :line line)
 
-    (if (instance? VarExpr fexpr)
+    (when (instance? VarExpr fexpr)
       (let [fvar (:var fexpr)
             pvar (get (meta fvar :protocol))]
-        (if (and (not-nil? pvar) (bound? *protocol-callsites*))
+        (when (and pvar (bound? #'*protocol-callsites*))
           (let [protocol? true
                 site-index (register-protocol-callsite (:var fexpr))
                 pon (get (var-get pvar) :on)
@@ -1473,10 +1530,10 @@
             (assoc! instance-values :protocol? protocol?)
             (assoc! instance-values :site-index site-index)
             (assoc! instance-values :protocol-on protocol-on)
-            (if (not-nil? protocol-on)
+            (when protocol-on
               (let [mmap (get (var-get pvar) :method-map)
                     mmap-val (get mmap (keyword (.sym pvar)))]
-                (if (nil? mmap-val)
+                (when-not mmap-val
                   (throw (IllegalArgumentException.
                           (str "No method of interface: "
                                (.getName protocol-on)
@@ -1490,7 +1547,7 @@
                                                     (dec (count args))
                                                     mname
                                                     false)]
-                  (if (not= 1 (.size methods))
+                  (when-not (= 1 (.size methods))
                     (throw (IllegalArgumentException.
                             (str "No single method: "
                                  mname
@@ -1501,7 +1558,7 @@
                                  " of protocol: "
                                  (.sym pvar)))))
                   (assoc! instance-values :on-method (.get methods 0)))))))))
-    (cond (not-nil? tag)
+    (cond tag
           (assoc! instance-values :tag tag)
 
           (instance? VarExpr fexpr)
@@ -1514,7 +1571,7 @@
                                          (>= (count args) (rest-offset))))
                               (tag-of sig)
                               (recur (next s)))))
-                tag (if (nil? sig-tag) (:tag fexpr) sig-tag)]
+                tag (if-not sig-tag (:tag fexpr) sig-tag)]
             (assoc! instance-values :tag tag))
 
           :else
@@ -1522,23 +1579,23 @@
     (map->InvokeExpr (persistent! instance-values))))
 
 (defn- check-if-instance-of-expr [context form fexpr]
-  (if (and (instance? VarExpr fexpr)
+  (when (and (instance? VarExpr fexpr)
              (= (:var fexpr) #'clojure.core/instance?))
-      (if (symbol? (second form))
+      (when (symbol? (second form))
         (let [c (maybe-class (second form) false)]
-          (if (not-nil? c)
+          (when c
             (new-instance-of-expr c (analyze context (third form))))))))
 
 (defn- check-if-invoke-prim-expr [context form fexpr]
-  (if (and (instance? VarExpr fexpr) (not= :eval context))
+  (when (and (instance? VarExpr fexpr) (not= :eval context))
     (let [v (:var fexpr)
           arglists (get (meta v) :arglists)
           arity (count (next form))]
       (loop [s (next (seq arglists))]
         (let [args (first s)]
-          (if (= arity (count args))
+          (when (= arity (count args))
             (let [primc (prim-interface args)]
-              (if (not-nil? primc)
+              (when primc
                 (analyze context
                          (apply list
                                 '.invokePrim
@@ -1546,9 +1603,9 @@
                                 (next form)))))))))))
 
 (defn- check-if-keyword-invoke-expr [context form fexpr]
-  (if (and (instance? KeywordExpr fexpr)
+  (when (and (instance? KeywordExpr fexpr)
            (= 2 (count form))
-           (bound? *keyword-callsites*))
+           (bound? #'*keyword-callsites*))
     (let [target (analyze context (second form))]
       (new-keyword-invoke-expr *source* *line* (tag-of form) fexpr target))))
 
@@ -1565,74 +1622,163 @@
             (new-invoke-expr *source* *line* (tag-of form) fexpr args)))))))
 
 (defn close-over [b method]
-  (if (and (not-nil? b) (not-nil? method))
+  (if (and b method)
     (cond (nil? (get (:locals method) b))
           (do
             (assoc! (:closes (:objx method)) b b)
             (close-over b (:parent method)))
 
-          (not-nil? *in-catch-finally*)
+          *in-catch-finally*
           (conj! (:locals-used-in-catch-finally method) (.idx b)))))
 
 (defn reference-local [sym]
-  (if (not (bound? *local-env*))
-    nil
+  (when (bound? #'*local-env*)
     (let [b (get *local-env* sym)]
-      (if (not-nil? b)
+      (when b
         (close-over b *method*))
       b)))
 
 
 
-(defn macro? [op]
-  (cond (and (symbol? op) (not-nil? (reference-local op)))
+(defn is-macro [op]
+  (cond (and (symbol? op) (reference-local op))
         nil
 
         (or (symbol? op) (var? op))
         (let [v (if (var? op)
                   op
                   (lookup-var op false false))]
-          (if (and (not-nil? v) (.isMacro v))
-            (if (and (not= *ns* (namespace v)) (not (.isPublic v)))
+          (when (and v (.isMacro v))
+            (if (and (not= *ns* (.ns v)) (not (.isPublic v)))
               (throw (IllegalStateException. (str "var: " v " is not public")))
               v)))))
 
 (defn is-inline [op arity]
   ; no local inlines for now
-  (cond (and (symbol? op) (not-nil? (reference-local op)))
+  (cond (and (symbol? op) (reference-local op))
         nil
         (or (symbol? op) (var? op))
         (let [v (if (var? op)
                   op
                   (lookup-var op false false))]
-          (if (and (not-nil? v) (.isMacro v))
+          (when (and v (.isMacro v))
             (if (and (not= *ns* (namespace v)) (not (.isPublic v)))
               (throw (IllegalStateException. (str "var: " v " is not public")))
               (let [ret (get (meta v) :inline)]
-                (if (not-nil? ret)
+                (when ret
                   (let [arity-pred (get (meta v) :inline-arities)]
-                    (if (or (nil? arity-pred) (arity-pred arity))
+                    (when (or (nil? arity-pred) (arity-pred arity))
                       ret)))))))))
 
 (defn names-static-member [sym]
-  (and (not-nil? (namespace sym)) (nil? (namespace-for sym))))
+  (and (namespace sym) (nil? (namespace-for sym))))
 
 (defn preserve-tag [src dst]
   (let [tag (tag-of src)]
-    (if (and (not-nil? tag) (instance? IObj dst))
+    (when (and tag (instance? IObj dst))
       (let [mmeta (meta dst)]
         (with-meta dst (assoc mmeta :tag tag))))))
 
-(declare analyze-symbol)
+(declare new-local-binding-expr)
+
+(defn analyze-symbol [sym]
+  (let [tag (tag-of sym)]
+    (if-not (namespace sym)
+      (let [b (reference-local sym)]
+        (when b
+          (new-local-binding-expr b tag)))
+      (when (namespace-for sym)
+        (let [ns-sym (symbol (namespace sym))
+              c (maybe-class ns-sym false)]
+          (when c
+            (if (Reflector/getField c (name sym) true)
+              (new-static-field-expr *line* c (name sym) tag)
+              (throw (RuntimeException. (str "Unable to find static field: "
+                                             (name  sym)
+                                             " in "c))))))))))
+
+(defn- get-line-number [form]
+  (if (and (meta form)
+           (contains? (meta form) :line))
+    (:line (meta form))
+    *line*))
+
+(defn macroexpand-1 [form]
+  (if (seq? form)
+    (let [op (first form)]
+       (if (special? op)
+         form
+         (let [v (is-macro op)]
+           (if v
+             (try
+               (apply v (cons form (cons *local-env* (next form))))
+               (catch ArityException e
+                 (throw (ArityException. (- (.actual e) 2) (.name e)))))
+             (if (symbol? op)
+               (let [sym op
+                     sname (name sym)]
+                 (cond
+                  (= \. (.charAt (name sym) 0))
+                  (do
+                    (when (< (count form) 2)
+                      (throw (IllegalArgumentException. "Malformed member expression, expecting (.member target ...)")))
+                    (let [meth (symbol (.substring sname 1))
+                          target (second form)
+                          target (if (maybe-class target false)
+                                   (with-meta (list 'clojure.core/identity target)
+                                     {:tag 'Class}))]
+                      (preserve-tag form (apply list '. target meth (next (next form))))))
+
+
+                  (names-static-member sym)
+                  (let [target (symbol (namespace sym))
+                        c (maybe-class target false)]
+                    (when c
+                      (let [meth (symbol (name symbol))]
+                        (preserve-tag form (apply list '. target meth (next form))))))
+
+                  :else
+                  (let [idx (.lastIndexOf sname ".")]
+                    (when (= idx (dec (.length sname)))
+                      (list* 'new (symbol (.substring sname 0 idx)) (next form))))))
+               form)))))
+    form))
+
+(defn macroexpand
+  "Repeatedly calls macroexpand-1 on form until it no longer
+  represents a macro form, then returns it.  Note neither
+  macroexpand-1 nor macroexpand expand macros in subforms."
+  {:added "1.0"
+   :static true}
+  [form]
+    (let [ex (macroexpand-1 form)]
+      (if (identical? ex form)
+        form
+        (macroexpand ex))))
+
 (defn analyze-seq [context form name]
-  nil
-  )
+  (let [line (get-line-number form)]
+    (binding [*line* line]
+      (let [me (macroexpand-1 form)]
+        (if-not (= form me)
+          (analyze context me name)
+          (let [op (first form)]
+            (if-not op
+              (throw (IllegalArgumentException. "Can't call nil"))
+              (let [inline (is-inline op (count (next form)))]
+                (if inline
+                  (analyze context (preserve-tag form (inline (next form))))
+                  (cond (= op 'fn*) (parse-fn-expr context form name)
+                        (get specials op)
+                        ((get specials op) context form)
+                        :else (parse-invoke-expr context form)))))))))))
+
 (declare register-keyword)
 
 (defn- handle-lazy-seq [potentially-lazy-seq]
   (if (instance? LazySeq potentially-lazy-seq)
     (let [form (seq potentially-lazy-seq)]
-      (if (nil? form) () (seq form)))
+      (if-not form () (seq form)))
     potentially-lazy-seq))
 
 (defn analyze
@@ -1652,13 +1798,10 @@
 
              (and (coll? form) (= 0 (count form)))
              (let [ret (new-empty-expr form)]
-               (if (not-nil? (meta form))
+               (if (meta form)
                  (new-meta-expr ret (parse-map-expr (eval-or-expression context)
                                                     (meta form)))
                  ret))
-
-
-
              (seq? form) (analyze-seq context form name)
              (vector? form) (parse-vector-expr context form)
              (record? form) (new-constant-expr form)

@@ -1,5 +1,6 @@
 (ns clojure.tests.compiler
-  (:refer-clojure :exclude [*source* *source-path* *compile-files* *line* *compile-path* munge])
+  (:refer-clojure :exclude [*source* *source-path* *compile-files* *compile-path*
+                            munge macroexpand-1 macroexpand])
   (:use [clojure.compiler])
   (:use [clojure.test]))
 
@@ -15,3 +16,6 @@
          (analyze :expression 123)))
   (is (= #clojure.compiler.StringExpr{:str "abcd"}
          (analyze :expression "abcd"))))
+
+(deftest test-macro-expansion
+  (is (= '(if 1 (do 2 3)) (macroexpand-1 '(when 1 2 3)))))
