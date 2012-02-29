@@ -1,7 +1,27 @@
 (ns clojure.compiler.helpers
   (:use [clojure.utilities])
-  (:import [clojure.lang IRecord]))
+  (:import [clojure.lang IRecord])
+  (:import [clojure.asm.commons Method]))
 
+(def bind-root-method (Method/getMethod "void bindRoot(Object)"))
+(def set-tag-method (Method/getMethod "void setTag(clojure.lang.Symbol)"))
+(def set-meta-method (Method/getMethod "void setMeta(clojure.lang.IPersistentMap)"))
+(def set-dynamic-method (Method/getMethod "clojure.lang.Var setDynamic(boolean)"))
+(def symintern (Method/getMethod "clojure.lang.Symbol intern(String, String)"))
+(def set-method (Method/getMethod "Object set(Object)"))
+(def for-name-method (Method/getMethod "Class forName(String)"))
+(def import-class-method (Method/getMethod "Class importClass(Class)"))
+(def deref-method (Method/getMethod "Object deref()"))
+(def invoke-no-arg-instance-member (Method/getMethod "Object invokeNoArgInstanceMember(Object,String)"))
+(def set-instance-field-method (Method/getMethod "Object setInstanceField(Object,String,Object)"))
+(def invoke-instance-method-method (Method/getMethod "Object invokeInstanceMethod(Object,String,Object[])"))
+(def invoke-static-method-method (Method/getMethod "Object invokeStaticMethod(Class,String,Object[])"))
+(def for-name-method (Method/getMethod "Class forName(String)"))
+(def equiv-method (Method/getMethod "boolean equiv(Object, Object)"))
+(def for-name-method (Method/getMethod "Class forName(String)"))
+(def invoke-constructor-method (Method/getMethod "Object invokeConstructor(Class,Object[])"))
+(def array-to-list-method (Method/getMethod "clojure.lang.ISeq arrayToList(Object[])"))
+(def map-method (Method/getMethod "clojure.lang.IPersistentMap map(Object[])"))
 
 (defn represents-static? [sym]
   (not= \- (.charAt (name sym) 0)))

@@ -341,11 +341,7 @@
       (.setMeta (evaluate meta)))
     (.setDynamic var dynamic?))
   (emit [this context objx gen]
-    (let [bind-root-method (Method/getMethod "void bindRoot(Object)")
-          set-tag-method  (Method/getMethod "void setTag(clojure.lang.Symbol)")
-          set-meta-method  (Method/getMethod "void setMeta(clojure.lang.IPersistentMap)")
-          set-dynamic-method  (Method/getMethod "clojure.lang.Var setDynamic(boolean)")
-          symintern  (Method/getMethod "clojure.lang.Symbol intern(String, String)")]
+    (do
       (.emitVar objx gen var)
       (if dynamic?
         (do
@@ -446,7 +442,7 @@
   AssignableExpr
   (eval-assign [this val] (var-set var (evaluate val)))
   (emit-assign [this context objx gen val]
-    (let [set-method (Method/getMethod "Object set(Object)")]
+    (do
       (emit-var objx var)
       (emit val :expression objx gen)
       (.invokeVirtual gen var-type set-method)
@@ -496,17 +492,14 @@
       nil))
 
   (emit [this context objx gen]
-    (let [for-name-method (Method/getMethod "Class forName(String)")
-          import-class-method (Method/getMethod "Class importClass(Class)")
-          deref-method (Method/getMethod "Object deref()")]
-      (doto gen
-        (.genStatic rt-type "CURRENT_NS" var-type)
-        (.invokeVirtual var-type deref-method)
-        (.checkCast ns-type)
-        (.push c)
-        (.invokeStatic class-type for-name-method)
-        (.invokeVirtual ns-type import-class-method))
-      (pop-if-statement)))
+    (doto gen
+      (.genStatic rt-type "CURRENT_NS" var-type)
+      (.invokeVirtual var-type deref-method)
+      (.checkCast ns-type)
+      (.push c)
+      (.invokeStatic class-type for-name-method)
+      (.invokeVirtual ns-type import-class-method))
+    (pop-if-statement))
 
   (has-java-class? [this] false)
   (get-java-class [this] (throw (IllegalArgumentException. "ImportExpr has no Java class"))))
@@ -818,19 +811,6 @@
     (catch NoSuchFieldException e
       (throw-runtime e))))
 
-(def invoke-no-arg-instance-member
-  (Method/getMethod "Object invokeNoArgInstanceMember(Object,String)"))
-(def set-instance-field-method
-  (Method/getMethod "Object setInstanceField(Object,String,Object)"))
-(def invoke-instance-method-method
-  (Method/getMethod "Object invokeInstanceMethod(Object,String,Object[])"))
-(def invoke-static-method-method
-  (Method/getMethod "Object invokeStaticMethod(Class,String,Object[])"))
-(def for-name-method (Method/getMethod "Class forName(String)"))
-(def equiv-method (Method/getMethod "boolean equiv(Object, Object)"))
-(def for-name-method (Method/getMethod "Class forName(String)"))
-(def invoke-constructor-method
-  (Method/getMethod "Object invokeConstructor(Class,Object[])"))
 
 (defrecord InstanceFieldExpr [target target-class field field-name line tag]
   Expr
@@ -1466,11 +1446,9 @@
   (evaluate [this]
     (seq (into [] (map #(evaluate %1) args))))
   (emit [this context objx gen]
-    (let [array-to-list-method (Method/getMethod
-                                "clojure.lang.ISeq arrayToList(Object[])")]
-      (emit-args-as-array args objx gen)
-      (.invokeStatic gen rt-type array-to-list-method)
-      (pop-if-statement)))
+    (emit-args-as-array args objx gen)
+    (.invokeStatic gen rt-type array-to-list-method)
+    (pop-if-statement))
   (has-java-class? [this] true)
   (get-java-class [this] IPersistentList))
 
@@ -1485,10 +1463,9 @@
         (aset ret (evaluate (nth keyvals i))))
       (RT/map ret)))
   (emit [this context objx gen]
-    (let [map-method (Method/getMethod "clojure.lang.IPersistentMap map(Object[])")]
-      (emit-args-as-array keyvals objx gen)
-      (.invokeStatic gen rt-type map-method)
-      (pop-if-statement)))
+    (emit-args-as-array keyvals objx gen)
+    (.invokeStatic gen rt-type map-method)
+    (pop-if-statement))
   (has-java-class? [this] true)
   (get-java-class [this] IPersistentMap))
 
