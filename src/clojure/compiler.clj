@@ -21,7 +21,7 @@
 (declare analyze)
 (declare emit-var)
 (declare emit-var-value)
-
+(declare register-local)
 
 (declare emit-nil-expr)
 (declare emit-clear-locals)
@@ -1165,6 +1165,165 @@
   (get-java-class [this] String))
 
 (defn new-string-expr [s] (->StringExpr s))
+
+(defrecord MonitorEnterExpr [target]
+  Expr
+  (has-java-class? [this] false)
+  (get-java-class [this] (throw (IllegalArgumentException. "Has no Java class")))
+  (evaluate [this] (throw (UnsupportedOperationException. "Can't eval monitor-enter")))
+  (emit [this context objx gen]
+    (emit target :expression objx gen)
+    (.monitorEnter gen)
+    (emit nil-expr context objx gen)))
+
+(defn parse-monitor-enter-expr [context form]
+  (->MonitorEnterExpr (analyze :expression (second form))))
+
+(defrecord MonitorExitExpr [target]
+  Expr
+  (has-java-class? [this] false)
+  (get-java-class [this] (throw (IllegalArgumentException. "Has no Java class")))
+  (evaluate [this] (throw (UnsupportedOperationException. "Can't eval monitor-exit")))
+  (emit [this context objx gen]
+    (emit target :expression objx gen)
+    (.monitorExit gen)
+    (emit nil-expr context objx gen)))
+
+(defn parse-monitor-exit-expr [context form]
+  (->MonitorExitExpr (analyze :expression (second form))))
+
+(defrecord CatchClause [^Class c, lb, handler, label, end-label])
+(defn new-catch-clause
+  ([c lb handler label end-label]
+     (map->CatchClause {:c c :lb lb :handler handler
+                        :label label :end-label end-label}))
+  ([c lb handler]
+     (new-catch-clause c lb handler nil nil)))
+
+(defrecord TryExpr [try-expr finally-expr catch-exprs ret-local finally-local]
+  Expr
+  (has-java-class? [this] (has-java-class? try-expr))
+  (get-java-class [this] (get-java-class try-expr))
+  (evaluate [this] (throw (UnsupportedOperationException. "Can't eval try")))
+  (emit [this context objx gen]
+    (let [start-try (.newLabel gen)
+          end-try (.newLabel gen)
+          end (.newLabel gen)
+          ret (.newLabel gen)
+          finally-label (.newLabel gen)
+          catch-exprs (doall (map #(assoc :label (.newLabel gen)
+                                          :end-label (.newLabel gen))
+                                  catch-exprs))]
+      (.mark gen start-try)
+      (emit try-expr context objx gen)
+      (when-not (= :statement context)
+        (.visitVarInsn gen (.getOpcode object-type Opcodes/ISTORE) ret-local))
+      (.mark gen end-try)
+      (when finally-expr
+        (emit finally-expr :statement objx gen))
+      (.goTo gen ret)
+      (doseq [clause catch-exprs]
+        (doto gen
+          (.mark (:label clause))
+          (.visitVarInsn (.getOpcode object-type Opcodes/ISTORE) (:idx (:lb clause))))
+        (emit (:handler clause) context objx gen)
+        (when-not (= :statement context)
+          (.visitVarInsn gen (.getOpcode object-type Opcodes/ISTORE) ret-local))
+        (.mark gen (:end-label clause))
+        (when finally-expr
+          (emit finally-expr :statement objx gen))
+        (.goTo gen ret))
+      (when finally-expr
+        (.mark gen finally-label)
+        (.visitVarInsn gen (.getOpcode object-type Opcodes/ISTORE) finally-local)
+        (emit finally-expr :statement objx gen)
+        (.visitVarInsn gen (.getOpcode object-type Opcodes/ILOAD) finally-local)
+        (.throwException gen))
+      (.mark gen ret)
+      (when-not (= :statement context)
+        (.visitVarInsn gen (.getOpcode object-type Opcodes/ILOAD) ret-local))
+      (.mark gen end)
+      (doseq [clause catch-exprs]
+        (.visitTryCatchBlock gen start-try end-try (:label clause)
+                             (.replace (.getName (:c clause)) "." "/")))
+      (when finally-expr
+        (.visitTryCatchBlock gen start-try end-try finally-label nil)
+        (doseq [clause catch-exprs]
+          (doto gen
+            (.visitTryCatchBlock (:label clause)
+                                 (:end-label clause)
+                                 finally-label
+                                 nil))))
+      (doseq [clause catch-exprs]
+        (.visitLocalVariable gen (:name (:lb clause)) "Ljava/lang/Object;" nil
+                             (:label clause)
+                             (:end-label clause)
+                             (:idx (:lb clause)))))))
+
+(defn new-try-expr [try-expr catch-exprs finally-expr ret-local finally-local]
+  (map->TryExpr {:try-expr try-expr
+                 :catch-exprs catch-exprs
+                 :finally-expr finally-expr
+                 :ret-local ret-local
+                 :finally-local finally-local}))
+
+
+(defn- op-is-catch-p [f] (and (seq? f) (= 'catch (first f))))
+(defn- op-is-finally-p [f] (and (seq? f) (= 'catch (first f))))
+
+(defn- not-catch-or-finally-p [f]
+  (not (and (seq? f) (contains? #{'catch 'finally} (first f)))))
+
+(defn- validate-catch-form [f]
+  (let [c (maybe-class (second f) false)]
+    (if-not c
+      (throw (IllegalArgumentException. "Unable to resolve classname: " (second f)))
+      (if-not (symbol? (third f))
+        (throw (IllegalArgumentException. "Bad binding form, expected symbol, got: "
+                                          (third f)))
+        (let [sym (third f)]
+          (if (namespace sym)
+            (throw (RuntimeException. "Can't bind qualified name:" sym))
+            f))))))
+
+(defn- parse-catch-clause [context f]
+  (validate-catch-form f)
+  (let [c (maybe-class (second f))
+        sym (third f)]
+    (binding [*local-env* *local-env*
+              *next-local-num* *next-local-num*
+              *in-catch-finally* true]
+      (let [lb (register-local sym (when (symbol? (second f)) (second f)) nil false )
+            handler (parse-body-expr context (next (next (next f))))]
+        (new-catch-clause c lb handler)))))
+
+(defn- parse-finally-clause [f]
+  (binding [*in-catch-finally* true]
+    (parse-body-expr :statement (next f))))
+
+(defn get-and-inc-local-num []
+  (let [num (.intValue *next-local-num*)]
+    (if (> num (:max-local *method*))
+      (var-set #'*next-local-num* (inc num)))
+    num))
+
+(defn parse-try-expr [context form]
+  (if-not (= :return context)
+    (analyze context (list (list 'fn* [] form)))
+    (let [ret-local (get-and-inc-local-num)
+          finally-local (get-and-inc-local-num)
+          body (doall (take-while not-catch-or-finally-p (next form)))
+          body-expr (binding [*no-recur* true] (parse-body-expr context (seq body)))
+          remaining (drop-while not-catch-or-finally-p (next form))]
+      (when-not (empty? (filter not-catch-or-finally-p remaining))
+        (throw (RuntimeException. "Only catch or finally clause can follow catch in try expression")))
+      (let [catches (map (partial parse-catch-clause context)
+                         (take-while op-is-catch-p remaining))
+            remaining (drop-while op-is-catch-p remaining)
+            finally-expr (parse-finally-clause (first remaining))]
+        (when (next remaining)
+          (throw (RuntimeException. "finally clause must be last in try expression")))
+        (new-try-expr body-expr catches finally-expr ret-local finally-local)))))
 
 (defrecord EmptyExpr [coll]
   Expr
