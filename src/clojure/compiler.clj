@@ -770,6 +770,7 @@
       (when-not second-match
         first-match))))
 
+
 (defrecord StaticFieldExpr [field-name c field tag line]
   Expr
   (evaluate [this] (Reflector/getStaticField c field-name))
@@ -1444,7 +1445,7 @@
 (defrecord ListExpr [args]
   Expr
   (evaluate [this]
-    (seq (into [] (map #(evaluate %1) args))))
+    (seq (into [] (map evaluate args))))
   (emit [this context objx gen]
     (emit-args-as-array args objx gen)
     (.invokeStatic gen rt-type array-to-list-method)
@@ -1525,7 +1526,7 @@
 
 (defrecord VectorExpr [args]
   Expr
-  (evaluate [this] (into [] (map #(evaluate %1) args)))
+  (evaluate [this] (into [] (map evaluate args)))
   (emit [this context objx gen]
     (let [vector-method (Method/getMethod "clojure.lang.IPersistentVector vector(Object[])")]
       (emit-args-as-array args objx gen)
@@ -1633,7 +1634,7 @@
   (evaluate [this]
     (try
       (let [fn (evaluate fexpr)
-            argvs (map #(evaluate %1) args)]
+            argvs (map evaluate args)]
         (.applyTo fn (seq argvs)))
       (catch Throwable e
         (if (instance? clojure.lang.Compiler$CompilerException e)
@@ -2158,7 +2159,7 @@
 (defrecord BodyExpr [exprs]
   Expr
   (evaluate [this]
-    (last (map #(evaluate %1) exprs)))
+    (last (map evaluate exprs)))
   (emit [this context objx gen]
     (doseq [e (butlast exprs)]
       (emit e :statement objx gen))
