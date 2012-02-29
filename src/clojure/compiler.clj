@@ -329,7 +329,6 @@
 
 
 (declare FnExpr)
-(declare ThrowExpr)
 
 (defrecord DefExpr [^Var var, init, meta,
                     init-provided?, dynamic?,
@@ -632,6 +631,21 @@
              (emit-unbox-arg objx gen (aget parameter-types i)))))
         (catch Exception e1
           (.printStackTrace e1 (err-print-writer)))))))
+
+(defrecord ThrowExpr [exc-expr]
+  Expr
+  (has-java-class? [this] false)
+  (get-java-class [this] (throw (IllegalArgumentException. "Has no Java class")))
+  (evaluate [this] (throw (RuntimeException. "Can't eval throw")))
+  (emit [this context objx gen]
+    (emit exc-expr :expression objx gen)
+    (.checkCast gen throwable-type)
+    (.throwException gen)))
+
+(defn parse-throw-expr [context form]
+  (if (= :eval context)
+    (analyze context (list (list 'fn* [] form)))
+    (->ThrowExpr (analyze :expression (second form)))))
 
 (defn maybe-class [form, string-ok?]
   (cond
