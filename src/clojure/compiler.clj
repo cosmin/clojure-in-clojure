@@ -242,7 +242,7 @@
 (defn namespace-for
   ([^Symbol sym] (namespace-for *ns* sym))
   ([^Namespace inns, ^Symbol sym]
-     (let [ns-sym (symbol (.ns sym))
+     (let [ns-sym (symbol (namespace sym))
            ns (.lookupAlias inns ns-sym )]
        (if (nil? ns)
          (Namespace/find ns-sym)
@@ -253,7 +253,7 @@
         (let [ns (namespace-for sym)]
           (if (nil? ns)
             nil
-            (let [name (symbol (name nil sym))]
+            (let [name (symbol nil (name sym))]
               (if (and intern-new? (= ns *ns*))
                 (.intern *ns* name)
                 (.findInternedVar ns name)))))
@@ -1975,6 +1975,8 @@
               e (analyze acontext (first forms))]
           (conj! exprs e)
           (recur (next forms)))))))
+
+
 
 (def specials
   {'def                      parse-def-expr

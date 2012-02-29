@@ -21,5 +21,9 @@
   (is (= :true (evaluate (analyze :expression '(if true :true :false)))))
   (is (= :false (evaluate (analyze :expression '(if false :true :false))))))
 
+(deftest test-import-expression
+  (evaluate (analyze :expression '(import [java.util Locale])))
+  (is (= java.util.Locale (ns-resolve *ns* 'Locale))))
+
 (deftest test-macro-expansion
   (is (= '(if 1 (do 2 3)) (macroexpand-1 '(when 1 2 3)))))
