@@ -1,6 +1,6 @@
 (ns clojure.tests.compiler
   (:refer-clojure :exclude [*source* *source-path* *compile-files* *compile-path*
-                            munge macroexpand-1 macroexpand])
+                            munge macroexpand-1 macroexpand eval])
   (:use [clojure.compiler])
   (:use [clojure.test]))
 
@@ -18,8 +18,8 @@
          (analyze :expression "abcd"))))
 
 (deftest test-if-expression
-  (is (= 1 (evaluate (analyze :expression '(if true 1 2)))))
-  (is (= 2 (evaluate (analyze :expression '(if false 1 2))))))
+  (is (= :true (evaluate (analyze :expression '(if true :true :false)))))
+  (is (= :false (evaluate (analyze :expression '(if false :true :false))))))
 
 (deftest test-macro-expansion
   (is (= '(if 1 (do 2 3)) (macroexpand-1 '(when 1 2 3)))))

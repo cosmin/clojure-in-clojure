@@ -1,6 +1,6 @@
 (ns clojure.compiler
   (:refer-clojure :exclude [*file* *source-path* *compile-path* *compile-files*
-                            munge macroexpand-1 macroexpand])
+                            munge macroexpand-1 macroexpand eval])
   (:use [clojure utilities runtime])
   (:use [clojure.compiler primitives helpers])
   (:use [clojure.lang reflection])
@@ -12,10 +12,10 @@
   (:import [clojure.lang Keyword Var Symbol Namespace])
   (:import [clojure.lang RT Numbers  Util Reflector Intrinsics])
   (:import [clojure.lang ArityException])
-  (:import [clojure.asm Type Opcodes])
+  (:import [clojure.asm Type Opcodes Label])
   (:import [clojure.asm.commons GeneratorAdapter Method])
   (:import [java.lang.reflect Constructor Modifier])
-  (:import [java.util ArrayList LinkedList])
+  (:import [java.util ArrayList LinkedList SortedMap TreeMap HashMap Set])
   (:import [java.util.regex Pattern]))
 
 (declare analyze)
@@ -486,6 +486,9 @@
   (has-java-class? [this] true)
   (get-java-class [this] Keyword))
 
+(defn new-keyword-expr [k]
+  (->KeywordExpr k))
+
 (defrecord ImportExpr [^String c]
   Expr
   (evaluate [this]
@@ -744,6 +747,7 @@
 (def invoke-static-method-method
   (Method/getMethod "Object invokeStaticMethod(Class,String,Object[])"))
 (def for-name-method (Method/getMethod "Class forName(String)"))
+(def equiv-method (Method/getMethod "boolean equiv(Object, Object)"))
 
 (defrecord InstanceFieldExpr [target target-class field field-name line tag]
   Expr
@@ -1592,6 +1596,13 @@
           (let [args (into [] (map #(analyze context (first %1)) (seq (next form))))]
             (new-invoke-expr *source* *line* (tag-of form) fexpr args)))))))
 
+(deftype PathNode [type parent])
+(defn new-path-node [type parent]
+  (->PathNode type parent))
+
+(defn clear-path-root []
+  *clear-root*)
+
 (defprotocol IfExprImpl
   (emit-if-expr [this context objx gen emit-unboxed?]))
 
@@ -1680,13 +1691,6 @@
                 :then-expr then-expr
                 :else-expr else-expr}))
 
-(deftype PathNode [type parent])
-(defn new-path-node [type parent]
-  (->PathNode type parent))
-
-(defn clear-path-root []
-  *clear-root*)
-
 (defn parse-if-expr [context form]
   (cond
    (> (count form) 4) (throw (RuntimeException. "Too many arguments to if"))
@@ -1699,6 +1703,278 @@
          else-expr (binding [*clear-path* (new-path-node :path branch)]
                      (analyze context (fourth form)))]
      (new-if-expr *line* test-expr then-expr else-expr))))
+
+(defprotocol CaseExprImpl
+  (is-shift-masked? [this])
+  (emit-case-expr [this context objx ^GeneratorAdapter gen emit-unboxed?])
+  (emit-expr-for-ints [this objx ^GeneratorAdapter gen expr-type default-label])
+  (emit-then-for-ints [this objx ^GeneratorAdapter gen
+                       expr-type test then default-label emit-unboxed?])
+  (emit-expr-for-hashes [this objx ^GeneratorAdapter gen])
+  (emit-then-for-hashes [this objx ^GeneratorAdapter gen
+                         test then default-label emit-unboxed?])
+  (emit-shift-mask [this ^GeneratorAdapter gen])
+  (emit-expr [this objx ^GeneratorAdapter gen expr emit-unboxed?]))
+
+
+(defrecord CaseExpr [expr shift mask low high default-expr
+                     ^SortedMap tests ^HashMap thens ^Set skip-check
+                     switch-type test-type return-type line]
+  Expr
+  (has-java-class? [this] (not-nil? return-type))
+  (get-java-class [this] return-type)
+  (evaluate [this] (throw (UnsupportedOperationException. "Can't eval case")))
+  (emit [this context objx gen] (emit-case-expr this context objx gen false))
+
+  MaybePrimitiveExpr
+  (can-emit-primitive [this] (primitive? return-type))
+  (emit-unboxed [this context objx gen] (emit-case-expr this context objx gen true))
+
+  CaseExprImpl
+  (emit-case-expr [this context objx gen emit-unboxed?]
+    (let [default-label (.newLabel gen)
+          end-label (.newLabel gen)]
+      (let [labels (TreeMap.)]
+        (doseq [i (.keySet tests)]
+          (.put labels i (.newLabel gen)))
+        (visit-line-number)
+        (let [prim-expr-class (maybe-primitive-type expr)
+              prim-expr-type (if prim-expr-class (Type/getType prim-expr-class))]
+          (if (= :int test-type)
+            (emit-expr-for-ints this objx gen prim-expr-type default-label)
+            (emit-expr-for-hashes this objx gen))
+          (if (= :sparse switch-type)
+            (let [la (make-array Label (.size labels))
+                  la (.. labels values (toArray la))
+                  ints (Numbers/int-array (.keySet tests))]
+              (.visitLookupSwitchInsn gen default-label ints la))
+            (let [la (make-array Label (inc (- high low)))]
+              (doseq [i (range low (inc high))]
+                (aset la (- i low) (if (.containsKey labels i)
+                                     (.get labels i)
+                                     default-label)))
+              (.visitTableSwitchInsn gen low high default-label la)))
+          (doseq [i (.keySet labels)]
+            (.mark gen (.get labels i))
+            (cond (= :int test-type)
+                  (emit-then-for-ints this objx gen
+                                      prim-expr-type
+                                      (.get tests i)
+                                      (.get thens i)
+                                      default-label
+                                      emit-unboxed?)
+
+                  (contains? skip-check i)
+                  (emit-expr this objx gen (.get thens i) emit-unboxed?)
+
+                  :else
+                  (emit-then-for-hashes this objx gen
+                                        (.get tests i)
+                                        (.get thens i)
+                                        default-label
+                                        emit-unboxed?)))
+          (.mark gen default-label)
+          (emit-expr this objx gen default-expr emit-unboxed?)
+          (.mark gen end-label)
+          (pop-if-statement)))))
+  
+  (is-shift-masked? [this] (not= 0 mask))
+  (emit-shift-mask [this gen]
+    (if (is-shift-masked? this)
+      (doto gen
+        (.push shift)
+        (.visitInsn Opcodes/ISHR)
+        (.push mask)
+        (.visitInsn Opcodes/IAND))))
+  
+  (emit-expr-for-ints [this objx gen expr-type default-label]
+    (cond (nil? expr-type)
+          (do
+            (when clojure.core/*warn-on-reflection*
+              (print-to-error-writer "Performance warning, %s:%d - case has int tests, but tested expression is not primitive.\n" *source-path* line))
+            (emit expr :expression objx gen)
+            (doto gen
+              (.instanceOf number-type)
+              (.ifZCmp GeneratorAdapter/EQ default-label))
+            (emit expr :expression objx gen)
+            (doto gen
+              (.checkCast number-type)
+              (.invokeVirtual number-type int-value-method number-type))
+            (emit-shift-mask this gen))
+
+          (or (= Type/LONG_TYPE  expr-type)
+              (= Type/INT_TYPE   expr-type)
+              (= Type/SHORT_TYPE expr-type)
+              (= Type/BYTE_TYPE  expr-type))
+          (do
+            (emit-unboxed expr :expression objx gen)
+            (.cast gen expr-type Type/INT_TYPE)
+            (emit-shift-mask this gen))
+
+          :else
+          (.goTo gen default-label)))
+  
+  (emit-then-for-ints [this objx gen expr-type test then default-label emit-unboxed?]
+    (cond
+     (nil? expr-type)
+     (do
+       (emit expr :expression objx gen)
+       (emit test :expression objx gen)
+       (.invokeStatic gen util-type equiv-method)
+       (.ifZCmp gen GeneratorAdapter/EQ default-label)
+       (emit-expr this objx gen then emit-unboxed?))
+
+     (= Type/LONG_TYPE expr-type)
+     (do
+       (emit-unboxed test :expression objx gen)
+       (emit-unboxed expr :expression objx gen)
+       (.ifCmp gen Type/LONG_TYPE GeneratorAdapter/NE default-label)
+       (emit-expr this objx gen then emit-unboxed))
+
+     (or (= Type/INT_TYPE expr-type)
+         (= Type/SHORT_TYPE expr-type)
+         (= Type/BYTE_TYPE expr-type))
+     (do
+       (when (is-shift-masked? this)
+         (emit-unboxed test :expression objx gen)
+         (emit-unboxed expr-type :expression objx gen)
+         (.cast gen expr-type Type/LONG_TYPE)
+         (.ifCmp gen Type/LONG_TYPE GeneratorAdapter/NE default-label))
+       (emit-expr this objx gen then emit-unboxed))
+
+     :else
+     (.goTo gen default-label)))
+  
+  (emit-expr-for-hashes [this objx gen]
+    (let [hash-method (Method/getMethod "int hash(Object)")]
+      (emit expr :expression objx gen)
+      (.invokeStatic gen util-type hash-method)
+      (emit-shift-mask this gen)))
+
+  (emit-then-for-hashes [this objx gen test then default-label emit-unboxed?]
+    (emit expr :expression objx gen)
+    (emit test :expression objx gen)
+    (if (= :hash-identity test-type)
+      (.visitJumpInsn Opcodes/IF_ACMPNE default-label)
+      (doto gen
+        (.invokeStatic util-type equiv-method)
+        (.ifZCmp GeneratorAdapter/EQ default-label)))
+    (emit-expr this objx gen then emit-unboxed?))
+  
+  (emit-expr [this objx gen expr emit-unboxed?]
+    (if (and emit-unboxed? (satisfies? MaybePrimitiveExpr expr))
+      (emit-unboxed expr :expression objx gen)
+      (emit expr :expression objx gen))))
+
+(defn new-case-expr [line expr shift mask low high
+                     default-expr tests thens
+                     switch-type test-type skip-check]
+  (let [instance-values (transient {})]
+    (assoc! instance-values :expr expr)
+    (assoc! instance-values :shift shift)
+    (assoc! instance-values :mask mask)
+    (assoc! instance-values :low low)
+    (assoc! instance-values :high high)
+    (assoc! instance-values :default-expr default-expr)
+    (assoc! instance-values :tests tests)
+    (assoc! instance-values :thens thens)
+    (assoc! instance-values :line line)
+    (when (and (not= switch-type :compact)
+               (not= switch-type :sparse))
+      (throw (IllegalArgumentException. (str "Unexpected switch type: " switch-type))))
+    (assoc! instance-values :switch-type switch-type)
+    (when (and (not= test-type :int)
+               (not= test-type :hash-equiv)
+               (not= test-type :hash-identity))
+      (throw (IllegalArgumentException. (str "Unexpected test type: " + switch-type))))
+    (assoc! instance-values :test-type test-type)
+    (assoc! instance-values :skip-check skip-check)
+    (assoc! instance-values :return-type (maybe-java-class
+                                          (doto (ArrayList. (.values thens))
+                                            (.add default-expr))))
+    (if (and (> (count skip-check) 0)
+             clojure.core/*warn-on-reflection*)
+      (print-to-error-writer (str "Performance warning, %s:%d - hash collision "
+                                  "of some case test constants; if selected, "
+                                  "those entries will be tested sequentially.\n"
+                                  *source-path* line)))
+    (map->CaseExpr (persistent! instance-values))))
+
+(defn parse-case-expr [context form]
+  (if (= :eval context)
+    (analyze context (list (list ('fn* [] form))))
+    (let [args (into [] (next form))
+          expr-form (nth args 0)
+          shift (.intValue (nth args 1))
+          mask (.intValue (nth args 2))
+          default-form (nth args 3)
+          case-map (nth args 4)
+          switch-type (nth args 5)
+          test-type (nth args 6)
+          skip-check (if (< (count args) 8) nil (nth args 7))
+          keys (keys case-map)
+          low (.intValue (first keys))
+          high (.intValue (nth keys (dec (count keys))))
+          test-expr (assoc (analyze :expression expr-form) :should-clear? false)
+          tests (TreeMap.)
+          thens (HashMap.)
+          branch (new-path-node :branch *clear-path*)]
+      (doseq [[k pair] (seq case-map)]
+        (let [minhash (.intValue k)
+              test-expr (if (= :int test-type)
+                          (parse-number-expr (.intValue (first pair)))
+                          (new-constant-expr (first pair)))]
+          (.put tests minhash test-expr)
+          (let [then-expr (binding [*clear-path* (new-path-node :path branch)]
+                            (analyze context (second pair)))]
+            (.put thens minhash then-expr))))
+      (let [default-expr (binding [*clear-path* (new-path-node :path branch)]
+                           (analyze context (nth args 3)))
+            line (.intValue *line*)]
+        (new-case-expr line test-expr shift mask low high
+                       default-expr tests thens switch-type test-type skip-check)))))
+(defn last* [vec]
+  (nth vec (dec (count vec))))
+
+(defrecord BodyExpr [exprs]
+  Expr
+  (evaluate [this]
+    (last (map #(evaluate %1) exprs)))
+  (emit [this context objx gen]
+    (doseq [e (butlast exprs)]
+      (emit e :statement objx gen))
+    (emit (last* exprs) context objx gen))
+  (has-java-class? [this] (has-java-class? (last* exprs)))
+  (get-java-class [this] (get-java-class (last* exprs)))
+  
+  MaybePrimitiveExpr
+  (can-emit-primitive [this]
+    (and (satisfies? MaybePrimitiveExpr (last* exprs))
+         (can-emit-primitive (last* exprs))))
+  (emit-unboxed [this context objx gen]
+    (doseq [e (butlast exprs)]
+      (emit e :statement objx gen))
+    (emit-unboxed (last* exprs) context objx gen))
+  )
+
+(defn new-body-expr [exprs]
+  (->BodyExpr exprs))
+
+(defn parse-body-expr [context forms]
+  (let [forms  (if (= 'do (first forms)) (next forms) forms)
+        exprs (transient [])]
+    (loop [forms forms]
+      (if-not forms
+        (do (when (= 0 (count exprs))
+              (conj! exprs nil-expr))
+            (new-body-expr (persistent! exprs)))
+        (let [acontext (if (and (not= :eval context)
+                                (or (= :statement context) (not-nil? (next forms))))
+                         :statement
+                         context)
+              e (analyze acontext (first forms))]
+          (conj! exprs e)
+          (recur (next forms)))))))
 
 (def specials
   {'def                      parse-def-expr
@@ -1879,7 +2155,13 @@
                         ((get specials op) context form)
                         :else (parse-invoke-expr context form)))))))))))
 
-(declare register-keyword)
+(defn register-keyword [keyword]
+  (if-not (bound? #'*keywords*)
+    (new-keyword-expr keyword)
+    (let [id (get *keywords* keyword)]
+      (when-not id
+        (var-set *keywords* (assoc *keywords* keyword (register-constant keyword))))
+      (new-keyword-expr keyword))))
 
 (defn- handle-lazy-seq [potentially-lazy-seq]
   (if (instance? LazySeq potentially-lazy-seq)
@@ -1919,3 +2201,34 @@
            (if (instance? clojure.lang.Compiler$CompilerException e)
              (throw e)
              (throw (clojure.lang.Compiler$CompilerException. *source-path* *line* e))))))))
+
+(defn eval [form]
+  (binding [*loader* (RT/makeClassLoader)
+            *line* (get-line-number form)]
+    (try
+      (let [form (macroexpand form)]
+        (cond
+         (and (coll? form) (= (first form) 'do))
+         (doseq [s (seq form)]
+           (eval s))
+
+         (or (instance? IType form)
+             (and (coll? form)
+                  (not (and (symbol? (first form))
+                            (-> form first name (.startsWith "def"))))))
+         (do
+           (println "here")
+           (let [fexpr (analyze :expression
+                                (list 'fn* [] form)
+                                (str "eval" (RT/nextID)))]
+             (let [fn (evaluate fexpr)]
+               (.invoke fn))))
+
+         :else
+         (do
+           (println form)
+           (let [expr (analyze :eval form)]
+             (println expr)
+             (evaluate expr)))))
+      (catch Throwable e
+        (throw-runtime e)))))
