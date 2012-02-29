@@ -91,7 +91,7 @@
         (= 0 (.size (Reflector/getMethods (.getjavaclass instance) 0 (munge (name sym)) false)))
         ))))
 
-
+(def compile-stub-prefix "compile__stub")
 (def max-positional-arity 20)
 
 (defmacro defasmtype [name klass]
@@ -701,6 +701,72 @@
         (throw (IllegalArgumentException.
                 (str "Unable to resolve classname: " tag)))))))
 
+(defn destub-class-name [class-name]
+  (if (.startsWith class-name compile-stub-prefix)
+    (.substring class-name (inc (.length compile-stub-prefix)))
+    class-name))
+
+(defrecord NewExpr [args ctor c]
+  Expr
+  (evaluate [this]
+    (let [argvals (into-array (map evaluate args))]
+      (if ctor
+        (try
+          (.newInstance ctor (box-args (.getParameterTypes ctor) argvals))
+          (catch Exception e
+            (throw-runtime e)))
+        (Reflector/invokeConstructor c argvals))))
+  (emit [this context objx gen]
+    (if ctor
+      (let [type (Type/getType c)]
+        (.newInstance gen type)
+        (.dup gen)
+        (emit-typed-args objx gen (.getParameterTypes ctor) args)
+        (emit-clear-locals-if-return)
+        (.invokeConstructor gen type (Method. "<init>"
+                                              (Type/getConstructorDescriptor ctor))))
+      (do
+        (.push gen (destub-class-name (.getName c)))
+        (.invokeStatic gen class-type for-name-method)
+        (emit-args-as-array args objx gen)
+        (emit-clear-locals-if-return)
+        (.invokeStatic gen reflector-type invoke-constructor-method)))
+    (if (= :statement context)
+      (.pop gen)))
+  (has-java-class? [this] true)
+  (get-java-class [this] c))
+
+(defn new-new-expr [c args line]
+  (let [allctors (.getConstructors c)
+        ctors (ArrayList.)
+        params (ArrayList.)
+        rets (ArrayList.)]
+    (doseq [ctor allctors]
+      (when (= (count args) (alength (.getParameterTypes ctor)))
+        (.add ctors ctor)
+        (.add params (.getParameterTypes ctor))
+        (.add rets c)))
+    (when (.isEmpty ctors)
+      (throw (IllegalArgumentException. (str "No matching ctor found for " c))))
+    (let [ctoridx (if (> (.size ctors) 1)
+                    (get-matching-params (.getName c) params args rets)
+                    0)]
+      (let [ctor (if (>= ctoridx 0) (.get ctors ctoridx))]
+        (when-not ctor
+          (print-to-error-writer "Reflection warning, %s:%d - call to %s ctor can't be resolved.\n" *source-path* line (.getName c)))
+        (map->NewExpr {:args args :c c :ctor ctor})))))
+
+(defn parse-new-expr [context form]
+  (when (< (count form) 2)
+    (throw (RuntimeException. "wrong number of arguments, expecting: (new Classname args...)")))
+  (let [c (maybe-class (second form) false)]
+    (when-not c
+      (throw (IllegalArgumentException. (str "Unable to resolve classname: "
+                                             (second form)))))
+    (let [args (into [] (map (partial analyze (eval-or-expression context))
+                             (next (next form))))]
+      (new-new-expr c args *line*))))
+
 
 (defn- maybe-java-class [exprs]
   (let [without-throw (filter #(not (instance? ThrowExpr %)) exprs)
@@ -762,6 +828,9 @@
   (Method/getMethod "Object invokeStaticMethod(Class,String,Object[])"))
 (def for-name-method (Method/getMethod "Class forName(String)"))
 (def equiv-method (Method/getMethod "boolean equiv(Object, Object)"))
+(def for-name-method (Method/getMethod "Class forName(String)"))
+(def invoke-constructor-method
+  (Method/getMethod "Object invokeConstructor(Class,Object[])"))
 
 (defrecord InstanceFieldExpr [target target-class field field-name line tag]
   Expr
