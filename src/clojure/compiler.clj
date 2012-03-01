@@ -2196,6 +2196,77 @@
           (conj! exprs e)
           (recur (next forms)))))))
 
+(deftype BindingInit [binding init])
+(defn new-binding-init [binding init]
+  (->BindingInit binding init))
+
+(defn emit-let-fn-inits [fe gen objx lbset]
+  (throw (UnsupportedOperationException. "emit-let-fn-inits not implemented")))
+
+(defrecord LetFnExpr [binding-inits body]
+  Expr
+  (evaluate [this] (throw (UnsupportedOperationException. "Can't eval letfns")))
+  (emit [this context objx gen]
+    (doseq [bi binding-inits]
+      (.visitInsn gen Opcodes/ACONST_NULL)
+      (.visitVarInsn gen (.getOpcode object-type Opcodes/ISTORE) (:idx (:binding bi))))
+    (let [lbset (transient #{})]
+      (doseq [bi binding-inits]
+        (let [fe (:init bi)]
+          (.visitVarInsn gen (.getOpcode object-type Opcodes/ISTORE)
+                         (:idx (:binding bi)))
+          (emit-let-fn-inits fe gen objx (persistent! lbset))))
+      (loop [loop-label (.mark gen)]
+        (emit body context objx gen)
+        (let [end (.mark gen)]
+          (doseq [bi binding-inits]
+            (let [lname (:name (:binding bi))
+                  lname (if (.endsWith lname "__auto__")
+                          (str lname (RT/nextID))
+                          lname)
+                  primc (maybe-primitive-type (:init bi))]
+              (if primc
+                (.visitLocalVariable gen lname (Type/getDescriptor primc)
+                                     nil loop-label end (:idx (:binding bi)))
+                (.visitLocalVariable gen lname "Ljava/lang/Object;"
+                                     nil loop-label end (:idx (:binding bi))))))))))
+  (has-java-class? [this] (has-java-class? body))
+  (get-java-class [this] (get-java-class body)))
+
+(defn new-let-fn-expr [binding-inits body]
+  (map->LetFnExpr {:binding-inits binding-inits
+                   :body body}))
+
+(defn parse-let-fn-expr [context form]
+  (when-not (vector? (second form))
+    (throw (IllegalArgumentException. "Bad binding form, expected vector")))
+  (let [bindings (second form)]
+    (when-not (= 0 (mod (count bindings) 2))
+      (throw (IllegalArgumentException. "Bad binding form, expected matched symbol expression pairs")))
+    (let [body (next (next form))]
+      (if (= :eval context)
+        (analyze context (list (list 'fn* [] form)))
+        (binding [*local-env* *local-env*
+                  *next-local-num* *next-local-num*]
+          (let [lbs (transient [])]
+            (doseq [i (range 0 (count bindings) 2)]
+              (let [sym (nth bindings i)]
+                (when-not (symbol? sym)
+                  (throw (IllegalArgumentException.
+                          (str "Bad binding form, expected symbol, got: " sym))))
+                (when (namespace sym)
+                  (throw (RuntimeException. (str "Can't let qualified name: " sym))))
+                (let [lb (register-local sym (tag-of sym) nil false)]
+                  (conj! lbs (assoc :can-be-cleared? false)))))
+            (let [binding-inits (transient [])]
+              (doseq [i (range 0 (count bindings) 2)]
+                (let [sym (nth bindings i)
+                      init (analyze :expression (nth bindings (inc i)))
+                      lb (assoc (nth lbs (/ i 2)) :init init)
+                      bi (new-binding-init lb init)]
+                  (conj! binding-inits bi)))
+              (new-let-fn-expr (persistent! binding-inits)
+                               (parse-body-expr context body)))))))))
 
 
 (def specials
