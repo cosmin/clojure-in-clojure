@@ -1868,7 +1868,7 @@
         (emit-unboxed else-expr context objx gen)
         (emit else-expr context objx gen))
       (.mark gen end-label)))
-  
+
   Expr
   (evaluate [this]
     (let [t (evaluate test-expr)]
@@ -1890,8 +1890,8 @@
       (if then-class
         then-class
         (get-java-class else-expr))))
-    
-    
+
+
   MaybePrimitiveExpr
   (emit-unboxed [this context objx gen]
     (emit-if-expr this context objx gen true))
@@ -1997,7 +1997,7 @@
           (emit-expr this objx gen default-expr emit-unboxed?)
           (.mark gen end-label)
           (pop-if-statement)))))
-  
+
   (is-shift-masked? [this] (not= 0 mask))
   (emit-shift-mask [this gen]
     (if (is-shift-masked? this)
@@ -2006,7 +2006,7 @@
         (.visitInsn Opcodes/ISHR)
         (.push mask)
         (.visitInsn Opcodes/IAND))))
-  
+
   (emit-expr-for-ints [this objx gen expr-type default-label]
     (cond (nil? expr-type)
           (do
@@ -2033,7 +2033,7 @@
 
           :else
           (.goTo gen default-label)))
-  
+
   (emit-then-for-ints [this objx gen expr-type test then default-label emit-unboxed?]
     (cond
      (nil? expr-type)
@@ -2064,7 +2064,7 @@
 
      :else
      (.goTo gen default-label)))
-  
+
   (emit-expr-for-hashes [this objx gen]
     (let [hash-method (Method/getMethod "int hash(Object)")]
       (emit expr :expression objx gen)
@@ -2080,7 +2080,7 @@
         (.invokeStatic util-type equiv-method)
         (.ifZCmp GeneratorAdapter/EQ default-label)))
     (emit-expr this objx gen then emit-unboxed?))
-  
+
   (emit-expr [this objx gen expr emit-unboxed?]
     (if (and emit-unboxed? (satisfies? MaybePrimitiveExpr expr))
       (emit-unboxed expr :expression objx gen)
@@ -2166,7 +2166,7 @@
     (emit (last* exprs) context objx gen))
   (has-java-class? [this] (has-java-class? (last* exprs)))
   (get-java-class [this] (get-java-class (last* exprs)))
-  
+
   MaybePrimitiveExpr
   (can-emit-primitive [this]
     (and (satisfies? MaybePrimitiveExpr (last* exprs))
@@ -2241,7 +2241,7 @@
   (when-not (vector? (second form))
     (throw (IllegalArgumentException. "Bad binding form, expected vector")))
   (let [bindings (second form)]
-    (when-not (= 0 (mod (count bindings) 2))
+    (when-not (even? (count bindings))
       (throw (IllegalArgumentException. "Bad binding form, expected matched symbol expression pairs")))
     (let [body (next (next form))]
       (if (= :eval context)
@@ -2268,6 +2268,98 @@
               (new-let-fn-expr (persistent! binding-inits)
                                (parse-body-expr context body)))))))))
 
+(defrecord LetExpr [binding-inits body loop?]
+  MaybePrimitiveExpr
+
+  Expr
+  )
+
+(defn new-let-expr [binding-inits body loop?]
+  (map->LetExpr {:binding-inits binding-inits :body body :loop? loop? }))
+
+(defn- validate-let-bindings [form]
+  (when-not (vector? (second form))
+    (throw (IllegalArgumentException. "Bad binding form, expected vector")))
+  (when-not (even? (count (second form)))
+    (throw (IllegalArgumentException. "Bad binding form, expected matched symbol expression pairs")))
+  (let [bindings (second form)]
+    (doseq [sym (take-nth 2 bindings)]
+      (when-not (symbol? sym)
+        (throw (IllegalArgumentException.
+                (str "Bad binding form, expected symbol, got: " sym))))
+      (when (namespace sym)
+        (throw (RuntimeException. (str "Can't let qualified name: " sym)))))))
+
+(defn parse-let-expr [context form]
+  (validate-let-bindings form)
+  (let [loop? (= 'loop* (first form))
+        bindings (second form)
+        body (next (next form))]
+    (if (or (= :eval context)
+            (and (= :expression context) loop?))
+      (analyze context (list (list ('fn* [] form))))
+      (let [backup-method-locals (:locals *method*)
+            backup-method-index-locals (:index-locals *method*)
+            recur-mismatches (into [] (for [i (range (/ (count bindings) 2))] false))]
+        (loop [more-mismatches? true]
+          (let [ret
+                (binding* [*local-env* *local-env*
+                           *next-local-num* *next-local-num*
+                           *method* (assoc *method*
+                                      :locals backup-method-locals
+                                      :index-locals backup-method-index-locals)
+                           :if loop?
+                           *loop-locals* nil]
+                          (let [binding-inits (transient [])
+                                loop-locals (transient [])]
+                            (doseq [i (range 0 (count bindings) 2)]
+                              (let [sym (nth bindings i)
+                                    get-init (fn [init]
+                                               (if loop?
+                                                 (cond
+                                                  (and recur-mismatches (nth recur-mismatches (/ i 2)))
+                                                  (do
+                                                    (when clojure.core/*warn-on-reflection*
+                                                      (print-to-error-writer "Auto-boxing loop arg: " sym))
+                                                    (new-static-method-expr "" 0 nil RT "box" (vec init)))
+
+                                                  (= Integer/TYPE (maybe-primitive-type init))
+                                                  (new-static-method-expr "" 0 nil RT "longCast" (vec init))
+
+                                                  (= Float/TYPE (maybe-primitive-type init))
+                                                  (new-static-method-expr "" 0 nil RT "doubleCast" (vec init))
+                                                  :else
+                                                  init)))
+                                    init (analyze :expression (nth bindings (inc i)) (name sym))
+                                    init (get-init init i)
+                                    lb (register-local sym (tag-of sym) init false)
+                                    bi (new-binding-init lb init)]
+                                (conj! binding-inits bi)
+                                (when loop?
+                                  (conj! loop-locals lb))))
+
+                            (let [parse-body-expr-fn #(parse-body-expr (if loop?
+                                                                         :return context)
+                                                                       body)
+                                  body-expr (if loop?
+                                              (let [root (new-path-node :path *clear-path*)]
+                                                (binding [*clear-path* (new-path-node :path root)
+                                                          *clear-root* (new-path-node :path root)
+                                                          *no-recur* nil]
+                                                  (parse-body-expr-fn)))
+                                              (parse-body-expr-fn))]
+                              (if loop?
+                                (let [mismatches (for [i (range (count loop-locals))]
+                                                   (let [lb (nth loop-locals i)]
+                                                     (when (:recur-mismatch lb)
+                                                       (assoc! recur-mismatches i true)
+                                                       true)))]
+                                  (if (every? false? mismatches)
+                                    (new-let-expr (persistent! binding-inits) body-expr loop?)
+                                    :recur))))))]
+            (if (= :recur ret)
+              (recur true)
+              ret)))))))
 
 (def specials
   {'def                      parse-def-expr

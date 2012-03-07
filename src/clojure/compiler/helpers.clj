@@ -44,3 +44,14 @@
 
 (defn record? [obj]
   (instance? IRecord obj))
+
+(defmacro binding* [bindings & body]
+  (let [not-if #(not (= :if %1))
+        before-if (take-while not-if bindings)
+        after-if (drop-while not-if bindings)
+        condition (first (rest after-if))
+        remaining (rest (rest after-if))
+        new-vec (into [] before-if)
+        new-vec (if condition (vec (concat new-vec remaining)) new-vec)]
+    (println new-vec)
+    `(binding ~new-vec ~@body)))
