@@ -53,5 +53,4 @@
         remaining (rest (rest after-if))
         new-vec (into [] before-if)
         new-vec (if condition (vec (concat new-vec remaining)) new-vec)]
-    (println new-vec)
     `(binding ~new-vec ~@body)))

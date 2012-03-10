@@ -1,22 +1,21 @@
 (ns clojure.compiler
   (:refer-clojure :exclude [*file* *source-path* *compile-path* *compile-files*
                             munge macroexpand-1 macroexpand eval])
-  (:use [clojure utilities runtime])
-  (:use [clojure.compiler primitives helpers])
-  (:use [clojure.lang reflection])
   (:require [clojure.lang.intrinsics :as intrinsics])
-  (:import [clojure.lang ILookupSite ILookupThunk KeywordLookupSite IType])
-  (:import [clojure.lang PersistentArrayMap PersistentHashSet PersistentVector PersistentList PersistentList$EmptyList])
-  (:import [clojure.lang IPersistentList IPersistentMap IPersistentVector IPersistentSet])
-  (:import [clojure.lang IFn AFunction IObj LazySeq ISeq RestFn AFn])
-  (:import [clojure.lang Keyword Var Symbol Namespace])
-  (:import [clojure.lang RT Numbers  Util Reflector Intrinsics])
-  (:import [clojure.lang ArityException])
-  (:import [clojure.asm Type Opcodes Label])
-  (:import [clojure.asm.commons GeneratorAdapter Method])
-  (:import [java.lang.reflect Constructor Modifier])
-  (:import [java.util ArrayList LinkedList SortedMap TreeMap HashMap Set])
-  (:import [java.util.regex Pattern]))
+  (:use (clojure utilities runtime)
+        (clojure.compiler primitives helpers)
+        (clojure.lang reflection))
+  (:import (clojure.lang RT Util Reflector ILookupSite ILookupThunk IType IFn IObj
+                         ISeq LazySeq IPersistentList IPersistentMap IPersistentVector
+                         IPersistentSet PersistentArrayMap PersistentHashSet
+                         PersistentVector PersistentList PersistentList$EmptyList
+                         AFunction RestFn AFn Keyword Var Symbol Namespace Numbers
+                         Intrinsics ArityException KeywordLookupSite)
+           (clojure.asm Type Opcodes Label)
+           (clojure.asm.commons GeneratorAdapter Method)
+           (java.lang.reflect Constructor Modifier)
+           (java.util ArrayList LinkedList SortedMap TreeMap HashMap Set)
+           (java.util.regex Pattern)))
 
 (declare analyze)
 (declare emit-var)
@@ -28,26 +27,11 @@
 (declare host-expr-tag->class)
 
 (declare parse-fn-expr)
-(declare parse-def-expr)
-(declare parse-let-expr)
 (declare parse-recur-expr)
-(declare parse-if-expr)
-(declare parse-case-expr)
-(declare parse-let-expr)
-(declare parse-let-fn-expr)
 (declare parse-body-expr)
-(declare parse-constant-expr)
-(declare parse-the-var-expr)
-(declare parse-import-expr)
 (declare parse-host-expr)
-(declare parse-assign-expr)
 (declare parse-new-instance-deftype-expr)
 (declare parse-new-instance-reify-expr)
-(declare parse-try-expr)
-(declare parse-throw-expr)
-(declare parse-monitor-enter-expr)
-(declare parse-monitor-exit-expr)
-(declare parse-new-expr)
 (declare new-constant-expr)
 (declare new-meta-expr)
 
@@ -2331,7 +2315,7 @@
                                                   :else
                                                   init)))
                                     init (analyze :expression (nth bindings (inc i)) (name sym))
-                                    init (get-init init i)
+                                    init (get-init init)
                                     lb (register-local sym (tag-of sym) init false)
                                     bi (new-binding-init lb init)]
                                 (conj! binding-inits bi)
